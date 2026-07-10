@@ -11,9 +11,9 @@ Use this checklist to verify the web UI functionality before considering a relea
 ## Basic Functionality
 
 ### Page Load
-- [ ] Page loads without errors in browser console
-- [ ] All CSS renders correctly (dark theme, proper layout)
-- [ ] No 404s in network tab for resources (index.html, app.js)
+- [x] Page loads without errors in browser console
+- [x] All CSS renders correctly (dark theme, proper layout)
+- [x] No 404s in network tab for resources (index.html, app.js)
 
 ### Single Photo Upload
 - [x] Drag-drop JPG works
@@ -104,6 +104,6 @@ Record the following for each test run:
 ### 2026-07-10 — first user validation (release build)
 - Device: Android phone over LAN, `https://192.168.1.31:8090` (self-signed cert, `start_all.sh` LAN+HTTPS default, firewall opened via `open_firewall.sh`)
 - Server: RTX 5060 8 GB, CUDA 12.8, release commit d9623ef
-- Verified: live camera video stream, JPG upload, variant dropdown (f32/q8/q4), all five render styles
+- Verified: page load clean (no Chrome console errors, no 404s), live camera video stream, JPG upload, variant dropdown (f32/q8/q4), all five render styles
 - Not covered this run: PNG upload in UI (no PNG file available — API path covered by smoke test), click-to-choose, high-res mode, flip camera, error-handling rows
 - Anomalies: none reported
