@@ -1,0 +1,3 @@
+[submodule "3rdparty/depth-anything.cpp"]
+	path = 3rdparty/depth-anything.cpp
+	url = https://github.com/mudler/depth-anything.cpp
