@@ -84,7 +84,7 @@ Total: roughly one engineering week for the ~15 ms. Recommended trigger: needing
 | ggml-cuda custom-op extension | `third_party/ggml/src/ggml-cuda/ggml-cuda.cu` (local patch) | `GGML_OP_CUSTOM` nodes whose userdata carries a magic-tagged launch descriptor run on the CUDA backend (`supports_op` + dispatch case); everything else still goes to CPU |
 | Fused conv3×3 implicit GEMM | `src/cuda_head_kernels.cu` | BM×BN×BK = 64×64×8 tiled SGEMM with virtual-im2col B-gather; fused pre-ReLU / bias / residual epilogue; BM=32 variant for OC≤32 (out2a). Covers all 16 head 3×3 convs incl. fully-fused RCUs (2 launches instead of 5 ops) |
 | Pixel-shuffle transposed conv | `src/cuda_head_kernels.cu` | For stride==kernel (resize.0 4×4 s4, resize.1 2×2 s2) transposed conv is a plain GEMM `C[OC·s²][P_in]` + shuffle epilogue — replaces ggml's one-thread-per-output kernel that loops all IC·K² taps with divergent stride checks |
-| Integration | `src/dpt_blocks.cpp` (`conv2d`, `conv_transpose2d_p0`, `residual_conv_unit`) | Gated by `DA_CONV=cuda_fused` (set by default in `scripts/launch_depth_ui.sh`; `DA_CONV=im2col` reverts). Non-qualifying shapes fall through to stock ggml paths |
+| Integration | `src/dpt_blocks.cpp` (`conv2d`, `conv_transpose2d_p0`, `residual_conv_unit`) | Gated by `DA_CONV=cuda_fused` (set by default in `scripts/start.sh`; `DA_CONV=im2col` reverts). Non-qualifying shapes fall through to stock ggml paths |
 | Diagnostics | `DA_CUDA_HEAD_STATS=1` | Per-shape CUDA-event timing of every fused kernel, dumped at exit |
 
 ### What profiling actually found (differs from the plan)

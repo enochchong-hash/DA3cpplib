@@ -27,7 +27,7 @@ Net: **~32× faster** than the naive per-request CLI approach; **~26 fps** seque
 
 **Problem.** The CLI (`da3-cli`) is one-shot: every invocation pays process start, CUDA context init, and GGUF model load (~380 ms for f32) before any inference.
 
-**Change.** The service (`tools/depth_ui/server.cpp`) loads each model variant **once** via `da_capi_load()` on its first request and caches the `da_ctx*` in a global map for the process lifetime. Weights stay in VRAM; each request ships only the image. Warm requests report `model_load_ms: 0`.
+**Change.** The service (`src/server.cpp`) loads each model variant **once** via `da_capi_load()` on its first request and caches the `da_ctx*` in a global map for the process lifetime. Weights stay in VRAM; each request ships only the image. Warm requests report `model_load_ms: 0`.
 
 **Impact.** Removes ~380 ms (f32) / ~62 ms (q8) / ~44 ms (q4) + process overhead from every request after the first. All three variants resident together use well under 1.5 GB VRAM.
 
@@ -64,7 +64,7 @@ The CLI's warm forward was **43 ms at 504×336**, while the server measured ~294
 
 **Problem.** Per request the CPU was doing: JPEG decode (stb, ~8–10 ms), two-step cv2-style resize + ImageNet normalize (~5 ms), then a host→device copy of the CHW tensor. ~13–15 ms of CPU work + a needless CPU round-trip for data that starts (JPEG bits) and ends (graph input) near the GPU.
 
-**Change** (implemented in `tools/depth_ui/gpu_preprocess.{h,cu}` + small engine extensions):
+**Change** (implemented in `src/gpu_preprocess.{h,cu}` + small engine extensions):
 
 - **JPEG**: decoded by **nvJPEG** (hardware/CUDA) straight into device memory.
 - **PNG**: no consumer-GPU PNG decoder exists (it's DEFLATE), so PNGs decode on CPU (stb) with one H2D copy of the raw pixels — then join the same GPU pipeline.

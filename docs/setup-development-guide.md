@@ -1,6 +1,6 @@
 # Depth Anything 3 Service — Setup & Development Guide
 
-*Audience: internal engineers replicating, maintaining, or extending this setup. Assumes fluency with CMake, C++17, and CUDA builds.*
+*Audience: engineers building, maintaining, or extending this release. Assumes fluency with CMake, C++17, and CUDA builds.*
 
 ---
 
@@ -10,122 +10,105 @@ A local monocular depth-estimation service built from:
 
 | Component | Location | Role |
 |---|---|---|
-| [depth-anything.cpp](https://github.com/mudler/depth-anything.cpp) | `tools/depth-anything.cpp/` (git clone + its ggml submodule) | C++17/ggml port of ByteDance Depth Anything 3. Provides `libdepthanything.a`, a C API (`include/da_capi.h`), and the one-shot `da3-cli` |
-| GGUF models | `models/DepthAnything-Base-{F32,Q8,Q4}/` | DA3 *base* (DualDPT) weights from [mudler/depth-anything.cpp-gguf](https://huggingface.co/mudler/depth-anything.cpp-gguf) |
-| `depth-ui-server` | `tools/depth_ui/` (`server.cpp`, `index.html`, `CMakeLists.txt`) | **Our code.** Persistent C++ HTTP server + browser upload UI |
-| Scripts | `scripts/build_depth.sh`, `run_depth.sh`, `launch_depth_ui.sh` | Build / one-shot CLI / launch (indexed in `scripts/README.md`) |
+| [depth-anything.cpp](https://github.com/mudler/depth-anything.cpp) | `3rdparty/depth-anything.cpp/` — git submodule pinned to upstream `f4e17de`, plus **3 local patches** | C++17/ggml port of ByteDance Depth Anything 3. Provides `libdepthanything.a`, a C API (`include/da_capi.h`), and the one-shot `da3-cli` |
+| ggml | `3rdparty/depth-anything.cpp/third_party/ggml/` — nested submodule pinned by upstream to `3af5f57`, plus **1 local patch** | Compute backend (CUDA); the patch adds custom-op CUDA dispatch used by our fused DPT-head kernels |
+| Local patches | `scripts/patches/{depth-anything.cpp,ggml}/*.patch` | `git format-patch` files applied by `scripts/apply_patches.sh` (`git am --3way`, idempotent) |
+| GGUF models | `resources/nnmodels/DepthAnything-Base-{F32,Q8,Q4}/` | DA3 *base* (DualDPT) weights from [mudler/depth-anything.cpp-gguf](https://huggingface.co/mudler/depth-anything.cpp-gguf); fetched by `scripts/download_models.sh` |
+| `depth-ui-server` | `src/server.cpp`, `src/gpu_preprocess.cu`, `include/gpu_preprocess.h` | **Our code.** Persistent C++ HTTP server: model residency, GPU preprocess (nvJPEG + CUDA), GPU JPEG output, prewarm |
+| Web UI | `resources/html/index.html` + `resources/js/app.js` | Upload page, live camera, client-side render styles |
+| cpp-httplib | `3rdparty/cpp-httplib/` (`httplib.h` + `httplib.cpp` + LICENSE) | Vendored copy of the split httplib that llama.cpp uses — the `.cpp` **must** be compiled into the target or linking fails |
+| Scripts | `scripts/` | setup / build / start / stop / bench / TLS — see `README.md` |
 
 **Design constraints that shaped this (do not regress):**
 
 1. **No Python anywhere in the inference or serving path.** The server is pure C++ linking the engine directly. (Python may appear in tests/tooling only.)
-2. **Reuse the llama.cpp ecosystem where possible.** llama.cpp itself *cannot* run these GGUFs (vision architecture, no graph implementation), but depth-anything.cpp uses the same ggml backend library, and our server's HTTP layer is the exact `cpp-httplib` vendored in `llama/vendor/cpp-httplib` — same code that powers `llama-server`.
+2. **Relocatable and submodule-friendly.** No absolute paths: scripts resolve their root from `${BASH_SOURCE[0]}`; the binary resolves resources via env vars, then `<exe>/../resources` (`/proc/self/exe`), then a compile-time fallback; CMake uses `CMAKE_CURRENT_SOURCE_DIR` only (never `CMAKE_SOURCE_DIR` — wrong under `add_subdirectory()`). The only sanctioned absolute path is the installed CUDA toolkit (`/usr/local/cuda*`).
 3. **Model folders are labeled by quant** (`-F32`, `-Q8`, `-Q4`) because we compare quants side by side.
+4. **The API contract is frozen** — see `user-guide.md`; timing fields in responses are the product.
 
 ---
 
-## 2. Replicating from scratch
+## 2. Building from scratch
 
 ### 2.1 Prerequisites
 
-- NVIDIA GPU + driver capable of the target arch. Reference box: RTX 5060 8 GB (Blackwell, **compute capability 12.0**), driver 570.x, Ubuntu 22.04.
-- **CUDA toolkit 12.8** at `/usr/local/cuda` (Blackwell needs ≥12.8; Ubuntu's `nvidia-cuda-toolkit` apt package is 11.5 — too old. Install from NVIDIA's apt repo, see `scripts/build_cuda.sh` header).
-- CMake ≥ 3.18, gcc with C++17.
-- A checkout of llama.cpp at `llama/` (only for `vendor/cpp-httplib` — see §4.3 if you don't have one).
+- NVIDIA GPU + working driver (`nvidia-smi`). Reference: RTX 5060 8 GB (Blackwell, compute capability 12.0).
+- **CUDA toolkit ≥ 12.8** (Blackwell requires it). The scripts auto-detect `/usr/local/cuda*` even when Ubuntu's obsolete `nvidia-cuda-toolkit` apt package (11.5) shadows PATH; `scripts/setup_cuda.sh` installs 12.8 from NVIDIA's apt repo and `--remove-old` purges the 11.5 packages.
+- CMake ≥ 3.18, gcc with C++17, OpenSSL headers (optional, enables HTTPS).
 
-### 2.2 Get the engine
+### 2.2 One command
 
 ```sh
-git clone --depth 1 https://github.com/mudler/depth-anything.cpp tools/depth-anything.cpp
-cd tools/depth-anything.cpp
-git submodule update --init --recursive --depth 1     # pulls third_party/ggml
+scripts/setup.sh          # prereq checks → submodules → patches → models → build
 ```
 
-### 2.3 Get the models
+Idempotent. Piecewise equivalents:
 
 ```sh
-BASE=https://huggingface.co/mudler/depth-anything.cpp-gguf/resolve/main
-mkdir -p models/DepthAnything-Base-{F32,Q8,Q4}
-curl -L -o models/DepthAnything-Base-F32/depth-anything-base-f32.gguf  $BASE/depth-anything-base-f32.gguf   # 412 MB
-curl -L -o models/DepthAnything-Base-Q8/depth-anything-base-q8_0.gguf  $BASE/depth-anything-base-q8_0.gguf  # 149 MB
-curl -L -o models/DepthAnything-Base-Q4/depth-anything-base-q4_k.gguf  $BASE/depth-anything-base-q4_k.gguf  # 104 MB
+scripts/apply_patches.sh              # submodule init + git am the local patches
+scripts/download_models.sh all        # or f32|q8|q4
+scripts/build.sh                      # cmake configure + build (single tree)
 ```
 
-Upstream quant availability for **DA3 base**: `f32`, `f16`, `q4_k`, `q8_0` **only**. The `q5_k`/`q6_k` files in that HF repo belong to the older *Depth Anything V2* models (`depth-anything2-*` prefix) — don't grab them by mistake. The repo also has `small`/`large`/`giant`/`mono-large`/`metric-large`/`nested` DA3 variants (nested = best metric-scale depth, needs two GGUFs and `da_capi_load_nested`).
+Outputs: `build/depth-ui-server` and `build/3rdparty/depth-anything.cpp/examples/cli/da3-cli`.
 
-### 2.4 Build
+`build.sh --arch native` (default) targets the host GPU; pass an explicit arch
+number for cross-builds (Blackwell = 120, needs CUDA ≥ 12.8).
 
-```sh
-scripts/build_depth.sh
-```
+### 2.3 How the patch mechanism works (read before touching submodules)
 
-which is equivalent to:
+- The release repo pins `3rdparty/depth-anything.cpp` at **upstream** `f4e17de`; our work ships as patch files, applied by `git am --3way` with original authorship. After patching, `git log` inside the submodule shows exactly what is local, and the gitlink shows as *modified* in the release repo — **expected**, don't "fix" it.
+- Apply order: ggml patch first (the engine code calls into the patched ggml API), then engine patches.
+- `git submodule update --checkout --force` **discards the patches** — re-run `scripts/apply_patches.sh` afterwards. The script detects already-applied/partial states by commit subject.
+- To change local engine code: commit inside the submodule, then regenerate patches:
+  ```sh
+  cd 3rdparty/depth-anything.cpp
+  git format-patch f4e17de..HEAD -o ../../scripts/patches/depth-anything.cpp/ \
+      -- . ':(exclude)third_party/ggml'      # NEVER include the gitlink hunk
+  ```
+  (For ggml: `git format-patch 3af5f57..HEAD -o ../../../../scripts/patches/ggml/` from inside `third_party/ggml`.)
 
-```sh
-export PATH=/usr/local/cuda/bin:$PATH
-FLAGS="-DCMAKE_BUILD_TYPE=Release -DDA_GGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120"
-cmake -B tools/depth-anything.cpp/build $FLAGS -S tools/depth-anything.cpp && cmake --build tools/depth-anything.cpp/build -j
-cmake -B tools/depth_ui/build          $FLAGS -S tools/depth_ui          && cmake --build tools/depth_ui/build -j
-```
-
-Adjust `CMAKE_CUDA_ARCHITECTURES` for other GPUs (`native` also works). Outputs:
-
-- `tools/depth-anything.cpp/build/examples/cli/da3-cli`
-- `tools/depth_ui/build/depth-ui-server`
-
-Note `tools/depth_ui/CMakeLists.txt` does `add_subdirectory(../depth-anything.cpp)` into its own binary dir, so the engine compiles twice (once per build tree). Accepted cost (~2 min) for keeping our code outside the cloned repo.
-
-### 2.5 Smoke test
+### 2.4 Smoke test
 
 ```sh
-scripts/run_depth.sh tools/depth-anything.cpp/assets/samples/desk.jpg /tmp/desk.depth.png
-# expect log lines: "ggml_cuda_init: found 1 CUDA devices" and "da::Backend using device: CUDA0"
-
-scripts/launch_depth_ui.sh 8090 &
+scripts/start_all.sh
 curl -s localhost:8090/health
-curl -s -X POST --data-binary @tools/depth-anything.cpp/assets/samples/desk.jpg \
-  -H "Content-Type: image/jpeg" "localhost:8090/depth?variant=q8" | head -c 300
+tests/smoke_test.sh          # 13 API-contract checks on an ephemeral port
+tests/parity_test.sh         # cuda_fused vs im2col numeric parity
+scripts/bench.sh             # stage timings; gates in docs/perf-baselines.md
 ```
 
 ---
 
-## 3. Server architecture (`tools/depth_ui/server.cpp`)
+## 3. Server architecture (`src/server.cpp`)
 
-Single translation unit, ~250 lines. Request flow for `POST /depth`:
+Single translation unit. Request flow for `POST /depth`:
 
 ```
 httplib thread pool (req.body already fully read by httplib)
-  → write body to mkstemp("/tmp/depth_ui_XXXXXX")      [da_capi only accepts file paths]
+  → write body to mkstemp("/tmp/depth_ui_XXXXXX")
   → lock g_mutex
-      → g_ctxs lookup; on miss: da_capi_load(path, n_threads) → cache in g_ctxs   [lazy, per variant]
-      → da_capi_depth_path(ctx, tmp, &h, &w) → float[h*w]
+      → per-variant engine cache lookup; miss = one-time load (prewarm avoids this)
+      → GPU path: nvJPEG decode → CUDA resize/normalize → D2D copy into graph input
+      → depth-only fused graph (custom DPT-head CUDA kernels, DA_CONV=cuda_fused)
   → unlock, unlink temp file
-  → normalize floats → uint8, FLIPPED (see below) → stb_image_write PNG in memory → base64
-  → hand-assembled JSON response with per-stage timings (std::chrono::steady_clock)
+  → depth normalize/flip on GPU → nvJPEG grayscale encode → binary JPEG response
+    (X-Timings-Ms header; ?format=json = legacy lossless PNG/base64 contract)
 ```
 
 Key decisions and invariants:
 
-- **Model residency**: `da_ctx*` per variant lives in a global map for the process lifetime, so only the first request per variant pays `da_capi_load` (F32 ~380 ms, Q8 ~60 ms, Q4 ~45 ms). All three resident simultaneously is fine on 8 GB.
-- **Serialization**: one global mutex covers load + inference. `da_ctx` thread-safety is not documented, and the GPU would be contended anyway. httplib's thread pool still overlaps network I/O and PNG/base64 encoding.
-- **Depth display convention**: the base DA3 DualDPT model emits **distance (larger = farther)** — verified empirically (near objects had low values). `depth_to_png()` flips during normalization (`hi - depth[i]`) so the PNG is conventional **near = bright**. If you add a model that emits *inverse* depth (some relative variants), the flip must become per-model.
-- **Timing fields** are measured server-side and returned as `timings_ms{save,model_load,infer,encode,server}`; the browser adds its own upload→render total. Keep these stable — they're the point of the tool.
-- **Response JSON** is built by hand (only dependency-free strings + base64); `json_escape()` is applied to error strings.
+- **Model residency**: engine contexts live in a global map for the process lifetime; prewarm (default, `DEPTH_UI_PREWARM=off` to skip) loads all downloaded variants + runs one dummy inference at startup, so even the first request is warm.
+- **Serialization**: one global mutex covers load + inference (single GPU; engine thread-safety undocumented). httplib's pool still overlaps network I/O.
+- **Resource resolution**: env `DA3_MODEL_DIR`/`DA3_WWW_DIR` → `<exe>/../resources/…` → compile-time default. `DA3_API_ONLY=1` disables the UI routes (JSON banner at `/`).
+- **Depth display convention**: base DA3 emits distance (larger = farther); the encoder flips so PNG/JPEG is near = bright. A model that emits *inverse* depth would need a per-model flip flag (see `docs/plans/future-work.md`).
+- **Timing fields** (`X-Timings-Ms` / `timings_ms`) are the point of the tool — keep names and semantics stable.
+- **Resolution paths**: default = production preprocess (longest side → 504, what DA3 was trained at); `?res=full` = legacy near-input resolution, ~10× slower, denser but not more accurate. Switching res re-triggers a one-time ggml graph compile (~200 ms).
+- **stb symbols**: `STB_IMAGE_WRITE_STATIC` keeps the server's stb copy TU-local so it can't collide with the engine's at link time.
+- **httplib vendoring**: `3rdparty/cpp-httplib/httplib.cpp` is compiled into the target (split vendoring, same as llama-server). OpenSSL, if found, enables `CPPHTTPLIB_OPENSSL_SUPPORT` for `--tls`.
 
-- **Resolution paths (major perf lever, found by profiling)**: `da_capi_depth_path` → `Engine::depth_image` uses the *legacy* preprocess (floor dims to patch multiple ≈ input resolution, e.g. 1022×672), while `da_capi_depth_dense` → `depth_pose_native` uses `preprocess_real`, the *production* DA3 pipeline (longest side → 504, e.g. 504×336 — what the model was trained at and what `da3-cli` uses). ~4× pixel difference ⇒ warm inference **~78 ms (std) vs ~300 ms/~790 ms (full)**. The server defaults to the production path; `?res=full` opts into the legacy path. Note: switching resolution re-triggers ggml graph compile (~200 ms one-off) — alternating res per request forfeits the warm-graph benefit. Enable the engine's own stage profiler with env `DA_PROFILE=1` (prints `preprocess=…ms graph(backbone+head)=…ms`); `da3-cli --repeat N` gives warm medians.
-
-Measured reference numbers (RTX 5060, desk.jpg): warm `infer_ms` ≈ 78 ms (std res) / ~300 ms (full res) — near-identical across **all** quant variants; quantization does not speed up warm GPU inference on this model, it buys load time, disk, and VRAM.
-
-### 3.1 The httplib vendoring gotcha
-
-llama.cpp vendors cpp-httplib **split** into `httplib.h` + `httplib.cpp` (not header-only). You must compile `${GEMMA4_ROOT}/llama/vendor/cpp-httplib/httplib.cpp` into the target or you get `undefined reference to httplib::Server::listen(...)`. Already handled in `tools/depth_ui/CMakeLists.txt`.
-
-### 3.2 stb symbols
-
-`server.cpp` defines `STB_IMAGE_WRITE_STATIC` before `STB_IMAGE_WRITE_IMPLEMENTATION` so its copy of stb_image_write stays TU-local and cannot collide with the engine library's own stb symbols at link time.
-
-### 3.3 Compile-time paths
-
-`CMakeLists.txt` injects `GEMMA4_ROOT` (repo root) and `DEPTH_UI_WWW` (source dir, where `index.html` is served from) as compile definitions. Consequence: the binary hard-codes absolute paths — rebuild if the repo moves (see deployment guide for packaging implications).
+Performance history and kernel details: `performance-optimization.md`,
+`dpt-head-cuda-kernel-plan.md` (as-built), `plans/gemm-rewrite-plan.md` (pending).
 
 ---
 
@@ -133,30 +116,33 @@ llama.cpp vendors cpp-httplib **split** into `httplib.h` + `httplib.cpp` (not he
 
 ### 4.1 Add a model variant
 
-1. Download the GGUF into `models/DepthAnything-<Name>/`.
-2. Add an entry to `MODEL_PATHS` in `server.cpp` (and the error string listing variants).
-3. Add an `<option>` to the variant `<select>` in `index.html`.
-4. Add a case to `scripts/run_depth.sh`.
-5. Update `scripts/README.md` + the user guide's variant table.
-6. Rebuild (`cmake --build tools/depth_ui/build -j`), restart, verify via `/health` and one POST per new variant.
+1. Download the GGUF into `resources/nnmodels/DepthAnything-<Name>/` (add it to `scripts/download_models.sh`).
+2. Add an entry to `MODEL_PATHS` in `src/server.cpp` (and the error string listing variants).
+3. Add an `<option>` to the variant `<select>` in `resources/html/index.html`.
+4. Add a case to `scripts/run_cli.sh`.
+5. Update the user guide's variant table; extend `tests/smoke_test.sh` test 3.
+6. Rebuild, restart, verify via `/health` and one POST per new variant.
 
-Caveat: `da_capi_load` signature covers single-GGUF models. The *nested* metric models need `da_capi_load_nested(anyview, metric, threads)` — a new code path, not just a map entry.
+Caveats: DA3 base upstream quants are `f32/f16/q4_k/q8_0` **only** — the `q5_k`/`q6_k` files in the HF repo belong to the older Depth Anything V2 models. The *nested* metric models need `da_capi_load_nested(anyview, metric, threads)` — a new code path, not just a map entry.
 
 ### 4.2 Extend the API
 
-`da_capi.h` also exposes pose (`da_capi_pose_path`), dense output with confidence/sky masks (`da_capi_depth_dense`), point clouds (`da_capi_points`), and glb/COLMAP export. All follow the same pattern: call under the mutex, free with the matching `da_capi_free_*`.
+`da_capi.h` also exposes pose, dense output with confidence/sky masks, point clouds, and glb/COLMAP export. All follow the same pattern: call under the mutex, free with the matching `da_capi_free_*`. (The server already bypasses the C API for `/depth` and calls `da::Engine` directly to skip the unused pose graph.)
 
-### 4.3 If there's no llama.cpp checkout
+### 4.3 A/B the custom CUDA kernels
 
-The only cross-dependency is httplib. Either fetch upstream cpp-httplib (truly header-only; drop the `.cpp` from the target and just `#include`), or copy the two vendored files. Keep the include path in `CMakeLists.txt` pointing wherever they land.
+Everything is env-gated: `--conv im2col` (or `DA_CONV=im2col`) reverts to stock ggml paths in one variable. `DA_PROFILE=1` prints per-stage engine timings; `DA_CUDA_HEAD_STATS=1` dumps per-shape kernel timings at exit; `da3-cli depth --model … --input … --repeat 20` gives server-independent warm medians.
 
 ---
 
 ## 5. Gotchas log (hard-won, read before debugging)
 
-- **`pkill -f depth-ui-server` kills your own shell** on this harness — the pattern matches the invoking command line. Use `scripts/stop_depth_ui.sh [port]` or `pkill -x depth-ui-server`.
-- **llama.cpp cannot load these GGUFs.** Don't try `llama-server -m depth-anything-*.gguf`; GGUF is just the container — the graph lives in depth-anything.cpp.
-- **Exit code 127 from launch scripts** usually means a relative path after a `cd` elsewhere; scripts resolve `ROOT_DIR` from their own location, so invoke them by absolute path from anywhere.
-- **Ports 8080–8087 are reserved** by the LLM `launch_server.sh` fleet; depth got 8090. `TENSORRT_LLM_PLAN.md` also pencils 8090 for a future TRT-LLM server — if that ever lands, move one of them.
-- The engine binds host-read tensors on CPU (`4 host-read tensors kept on CPU` in the log) — normal, not a partial-offload bug.
-- Output resolution ≠ input resolution (model processes at its own grid, e.g. 1022×672 from a 1024-wide input). Don't assume 1:1 pixel mapping to the source image.
+- **`pkill -f depth-ui-server` can kill your own shell** — the pattern matches the invoking command line. Use `scripts/stop_all.sh` or `pkill -x depth-ui-server`.
+- **llama.cpp cannot load these GGUFs** (`unknown model architecture: 'depthanything3'`). GGUF is just the container — the graph lives in depth-anything.cpp.
+- **Ubuntu's `nvidia-cuda-toolkit` apt package is CUDA 11.5** and shadows `/usr/local/cuda` on PATH. The scripts prefer `/usr/local/cuda*` (see `scripts/cuda_env.sh`); `setup_cuda.sh --remove-old` removes the offender.
+- **Exit code 127 from scripts** usually means a relative path after a `cd` elsewhere; all scripts resolve their root from their own location, so invoke them by any path from anywhere.
+- **`git submodule update` after patching** resets the submodules and drops the local patches — re-run `scripts/apply_patches.sh` (§2.3).
+- The engine binds a few host-read tensors on CPU (`4 host-read tensors kept on CPU` in the log) — normal, not a partial-offload bug.
+- Output resolution ≠ input resolution (the model processes at its own grid). Don't assume 1:1 pixel mapping to the source image.
+- On the original gemma4 dev box, ports **8080–8087** belong to the LLM server fleet (host-specific note); depth uses 8090.
+- For sub-second GPU bursts use `nvidia-smi dmon -s u` (per-second SM%), not the long-window `utilization.gpu` counter — the latter reads near-idle during request loops that are actually GPU-bound.

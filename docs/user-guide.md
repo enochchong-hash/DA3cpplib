@@ -22,8 +22,8 @@ The UI's **Live camera** section streams your webcam through the depth model in 
 
 **Testing from a phone** (or any other device on your LAN):
 
-1. On the host PC: `DEPTH_UI_HOST=0.0.0.0 DEPTH_UI_TLS=1 scripts/launch_depth_ui.sh`
-   (both flags are opt-in: this exposes the un-authenticated server to your LAN and generates a self-signed TLS certificate — HTTPS is *mandatory* because phone browsers only allow camera access on secure origins).
+1. On the host PC: `scripts/start.sh --lan`
+   (opt-in: this exposes the un-authenticated server to your LAN and generates a self-signed TLS certificate — HTTPS is *mandatory* because phone browsers only allow camera access on secure origins).
 2. On the phone, open `https://<pc-lan-ip>:8090` and accept the certificate warning once.
 3. Tap **Start camera** and grant camera permission. **Flip camera** switches front/rear.
 
@@ -178,5 +178,5 @@ On GPU, warm inference speed is nearly identical across variants — quantizatio
 If you are on the host machine, you can skip HTTP entirely:
 
 ```sh
-scripts/run_depth.sh photo.jpg depth.png f32     # variants: f32 | q8 | q4
+scripts/run_cli.sh photo.jpg depth.png f32       # variants: f32 | q8 | q4
 ```

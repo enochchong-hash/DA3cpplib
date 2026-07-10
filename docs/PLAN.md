@@ -117,11 +117,15 @@ release/da3/
 6. **Models are never committed.** `resources/nnmodels/**/*.gguf` gitignored; `download_models.sh`
    is the installer. Keep quant-labeled folder names (`-F32/-Q8/-Q4`) — side-by-side comparison is
    a design constraint of the original service.
-7. **No absolute compile-time paths as the primary mechanism.** Runtime env vars
-   (`DA3_MODEL_DIR`, `DA3_WWW_DIR`) win; compile-time defaults remain as fallback so the bare
-   binary still works on the build host (§6.2). Launch scripts always set the env vars from their
-   own location → the repo becomes relocatable without rebuild (removes the current "rebuild if the
-   repo moves" limitation, keep it documented for bare-binary use).
+7. **No absolute compile-time paths as the primary mechanism; relative paths everywhere**
+   (user directive — the only sanctioned absolute path is the installed CUDA toolkit at
+   `/usr/local/cuda*`). Runtime resolution order: env vars (`DA3_MODEL_DIR`, `DA3_WWW_DIR`) →
+   `<exe>/../resources/…` via `/proc/self/exe` (relocatable bare binary) → compile-time default
+   (last resort). Launch scripts resolve everything from `${BASH_SOURCE[0]}`.
+   **The repo must work both standalone AND consumed as a git submodule of a parent repo** —
+   in CMake that means `CMAKE_CURRENT_SOURCE_DIR` only (never `CMAKE_SOURCE_DIR`, which points
+   at the parent under `add_subdirectory()`), keep standalone-only defaults behind
+   `if(NOT …)` guards, and scripts must not assume they sit at the git toplevel.
 8. **API contract is frozen.** `/depth` (binary JPEG + `X-*` headers; `?format=json` lossless PNG
    path; `?variant=`, `?res=`) and `/health` JSON shape must remain byte-compatible with
    `docs/user-guide.md`. The release adds only: backend-only mode and static serving of split
@@ -512,6 +516,9 @@ Function:
 - [ ] `smoke_test.sh` all 14 checks green; `parity_test.sh` green; §8.4 matrix green.
 - [ ] Backend-only mode: `start_server.sh` serves API without UI.
 - [ ] Relocatability: `mv` the repo (or clone to a second path) → `start_all.sh` works **without rebuild**.
+- [ ] Submodule consumption: adding the repo as a git submodule of a scratch parent repo and
+      building via the parent's `add_subdirectory(release-da3)` produces a working server;
+      `grep -rn CMAKE_SOURCE_DIR CMakeLists.txt` returns nothing.
 - [ ] systemd unit template instantiates and runs (if the box allows; else dry-run documented).
 
 Performance:
