@@ -6,7 +6,7 @@ Use this checklist to verify the web UI functionality before considering a relea
 
 - [ ] Browser: Chrome/Edge/Firefox latest
 - [ ] Device: Desktop or mobile on same LAN as server
-- [ ] Server running: `./scripts/start_all.sh`
+- [ ] Server running: `./scripts/start_all.sh` (defaults to LAN + HTTPS; firewall opened via `sudo ./scripts/open_firewall.sh`)
 
 ## Basic Functionality
 
@@ -70,7 +70,7 @@ Start with: `./scripts/start_server.sh`
 
 ## TLS / LAN Mode
 
-Start with: `./scripts/start.sh --lan --daemon`
+Start with: `./scripts/start_all.sh` (default) or `./scripts/start.sh --lan --daemon`
 
 - [ ] Self-signed certificate generated in `resources/certs/`
 - [ ] `https://<lan-ip>:8090` accessible

@@ -8,14 +8,19 @@
 # 1. Setup (one-time): prereqs → submodules → patches → models → build
 ./scripts/setup.sh
 
-# 2. Start the server
+# 2. Start the server (default: LAN + HTTPS, so phone cameras work;
+#    use --local for localhost-only plain HTTP)
 ./scripts/start_all.sh
 
+# 2b. First time only, to accept connections from other devices (phones):
+sudo ./scripts/open_firewall.sh
+
 # 3. Check health
-curl http://localhost:8090/health
+curl -k https://localhost:8090/health
 
 # 4. Open the web UI
-# http://localhost:8090
+# https://<this-pc-lan-ip>:8090   (from a phone; accept the cert warning once)
+# https://localhost:8090          (on this machine)
 ```
 
 ## What it does
@@ -69,14 +74,17 @@ release/da3/
 ### Starting the server
 
 ```sh
-# Full server with UI (daemonized)
+# Full server with UI, LAN + HTTPS (default; phone camera ready)
 ./scripts/start_all.sh
+
+# Localhost-only plain HTTP
+./scripts/start_all.sh --local
 
 # Backend only (no UI)
 ./scripts/start_server.sh --port 8090
 
-# With TLS (phone camera mode)
-./scripts/start.sh --lan --daemon
+# Granular control (host/port/TLS/prewarm/kernels)
+./scripts/start.sh --help
 ```
 
 ### API endpoints

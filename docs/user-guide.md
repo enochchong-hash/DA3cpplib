@@ -22,8 +22,8 @@ The UI's **Live camera** section streams your webcam through the depth model in 
 
 **Testing from a phone** (or any other device on your LAN):
 
-1. On the host PC: `scripts/start.sh --lan`
-   (opt-in: this exposes the un-authenticated server to your LAN and generates a self-signed TLS certificate — HTTPS is *mandatory* because phone browsers only allow camera access on secure origins).
+1. On the host PC: `scripts/start_all.sh` (LAN + HTTPS is the default; `scripts/start.sh --lan` for foreground). If the phone times out, open the firewall once: `sudo scripts/open_firewall.sh`.
+   (this exposes the un-authenticated server to your LAN and generates a self-signed TLS certificate — HTTPS is *mandatory* because phone browsers only allow camera access on secure origins; `start_all.sh --local` opts out).
 2. On the phone, open `https://<pc-lan-ip>:8090` and accept the certificate warning once.
 3. Tap **Start camera** and grant camera permission. **Flip camera** switches front/rear.
 
@@ -45,7 +45,7 @@ Notes: the first camera frame pays a one-time ~200 ms graph warm-up if your came
 | server total | Everything the server did, end to end |
 | upload → result (browser) | Full round-trip measured by your browser, including network transfer |
 
-Typical warm-request numbers on the reference hardware (RTX 5060): **~63 ms** server total at standard resolution (504 px, the default); **~800 ms** with the optional high-res mode.
+Typical warm-request numbers on the reference hardware (RTX 5060): **~34 ms** server total at standard resolution (504 px, the default); **~800 ms** with the optional high-res mode.
 
 ---
 
@@ -58,7 +58,7 @@ Send the **raw image bytes** as the request body (not multipart/form-data).
 | | |
 |---|---|
 | Query param `variant` | `f32` (default), `q8`, or `q4` |
-| Query param `res` | `std` (default): production resolution, longest side 504 px, ~52 ms warm. `full`: near-input resolution, ~4× the pixels, ~10× slower |
+| Query param `res` | `std` (default): production resolution, longest side 504 px, ~34 ms warm. `full`: near-input resolution, ~4× the pixels, ~20× slower |
 | Query param `format` | default: **binary JPEG** response (fastest, ~10 KB). `json`: legacy lossless PNG/base64 JSON |
 | `Content-Type` header | `image/jpeg` or `image/png` |
 | Body | Raw JPG/PNG bytes, max 64 MB |
@@ -158,9 +158,9 @@ All three are the same Depth Anything 3 *base* network at different numeric prec
 
 | Variant | File size | First-request load | Warm inference | When to use |
 |---|---|---|---|---|
-| `f32` | 412 MB | ~380 ms | ~315 ms | Reference quality; the default |
-| `q8` | 149 MB | ~60 ms | ~300 ms | Near-lossless; faster startup, smaller footprint |
-| `q4` | 104 MB | ~45 ms | ~300 ms | Smallest; quality visually indistinguishable in testing |
+| `f32` | 412 MB | ~380 ms | ~32 ms | Reference quality; the default |
+| `q8` | 149 MB | ~60 ms | ~32 ms | Near-lossless; faster startup, smaller footprint |
+| `q4` | 104 MB | ~45 ms | ~32 ms | Smallest; quality visually indistinguishable in testing |
 
 On GPU, warm inference speed is nearly identical across variants — quantization mainly buys smaller files, faster load, and less GPU memory. There is **no 6-bit variant** of this model upstream.
 

@@ -12,8 +12,8 @@
 | Purpose | Local image → depth-map web service (UI + REST API) |
 | Executable | `<repo>/build/depth-ui-server` |
 | Start command | `<repo>/scripts/start_all.sh` (or `scripts/start.sh` for options) |
-| Default port | **8090** (TCP, HTTP) |
-| Bind address | **127.0.0.1 only** (localhost); LAN + HTTPS is opt-in, see §7 |
+| Default port | **8090** (TCP) |
+| Bind address | `start_all.sh` defaults to **0.0.0.0 + HTTPS** (phone-camera ready, see §7); `start_all.sh --local` and bare `start.sh` bind **127.0.0.1**, plain HTTP |
 | Runs as | Any unprivileged user with read access to the repo and write access to `/tmp` and `<repo>/var` |
 | External network access | None required at runtime (models are on local disk) |
 | Data handling | Uploaded images are written to `/tmp/depth_ui_XXXXXX`, processed, and deleted within the same request. Nothing is stored. |
@@ -55,8 +55,10 @@ models, build — idempotent) or piecewise by `scripts/download_models.sh` and
 
 **Start (background, recommended):**
 ```sh
-<repo>/scripts/start_all.sh
+<repo>/scripts/start_all.sh          # LAN + HTTPS (default)
+<repo>/scripts/start_all.sh --local  # localhost-only plain HTTP
 # idempotent: calling it again reports "already running" and exits 0
+sudo <repo>/scripts/open_firewall.sh # once per host: allow incoming connections (§7.1)
 ```
 
 **Start (foreground, e.g. for a terminal session or systemd):**
