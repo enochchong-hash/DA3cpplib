@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Depth Anything 3 — live 3D camera</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; }
+  body { font: 15px/1.5 system-ui, sans-serif; background: #14161a; color: #e8eaed; padding: 16px; max-width: 1100px; margin: 0 auto; }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  h2 { font-size: 15px; margin: 20px 0 8px; color: #bdc1c6; }
+  .sub { color: #9aa0a6; font-size: 13px; margin-bottom: 14px; }
+  .controls { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+  select, button { background: #1e2126; color: #e8eaed; border: 1px solid #3c4043; border-radius: 6px; padding: 6px 12px; font-size: 14px; }
+  button { cursor: pointer; }
+  button:active { background: #2a2e35; }
+  button.primary { border-color: #8ab4f8; color: #8ab4f8; }
+  label { color: #9aa0a6; font-size: 13px; }
+  #drop { border: 2px dashed #3c4043; border-radius: 12px; padding: 24px; text-align: center; cursor: pointer; transition: border-color .15s; }
+  #drop.hover { border-color: #8ab4f8; }
+  #drop.busy { opacity: .6; pointer-events: none; }
+  .row { display: flex; gap: 12px; margin-top: 12px; flex-wrap: wrap; }
+  .card { flex: 1 1 300px; background: #1e2126; border-radius: 12px; padding: 10px; min-width: 260px; }
+  .card h3 { font-size: 12px; color: #9aa0a6; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 6px; }
+  .card img, .card video, .card canvas { max-width: 100%; border-radius: 8px; display: block; background: #000; }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; font-size: 14px; }
+  td { padding: 2px 8px 2px 0; }
+  td:last-child { text-align: right; font-weight: 600; }
+  .total td { border-top: 1px solid #3c4043; padding-top: 5px; color: #8ab4f8; }
+  #status { margin-top: 10px; min-height: 20px; color: #9aa0a6; font-size: 14px; }
+  #status.err { color: #f28b82; }
+  #hud { font-size: 14px; color: #8ab4f8; font-variant-numeric: tabular-nums; margin-top: 6px; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<h1>Depth Anything 3 — live 3D camera</h1>
+<div class="sub">depth-anything.cpp (ggml/CUDA) · RTX 5060 · GPU decode/inference/encode · client-side rendering</div>
+
+<div class="controls">
+  <label>Model:
+    <select id="variant">
+      <option value="f32">base F32</option>
+      <option value="q8" selected>base Q8_0</option>
+      <option value="q4">base Q4_K</option>
+    </select>
+  </label>
+  <label>Depth style:
+    <select id="style">
+      <option value="gray">Grayscale</option>
+      <option value="turbo" selected>Turbo</option>
+      <option value="viridis">Viridis</option>
+      <option value="inferno">Inferno</option>
+      <option value="relief">Relief 3D</option>
+    </select>
+  </label>
+  <label><input type="checkbox" id="fullres"> high-res (~6× slower, stills only)</label>
+</div>
+
+<h2>Live camera</h2>
+<div class="controls">
+  <button id="camBtn" class="primary">Start camera</button>
+  <button id="flipBtn" class="hidden">Flip camera</button>
+  <span id="hud"></span>
+</div>
+<div class="row">
+  <div class="card"><h3>Camera</h3><video id="video" autoplay playsinline muted></video></div>
+  <div class="card"><h3>Depth (live)</h3><canvas id="liveDepth"></canvas></div>
+</div>
+
+<h2>Single photo</h2>
+<div id="drop">
+  <strong>Drop a JPG/PNG here</strong> or tap to choose a file
+  <input type="file" id="file" accept="image/jpeg,image/png" class="hidden">
+</div>
+
+<div id="status"></div>
+
+<div class="row hidden" id="results">
+  <div class="card"><h3>Original</h3><img id="orig" alt="original"></div>
+  <div class="card"><h3>Depth map</h3><canvas id="stillDepth"></canvas></div>
+  <div class="card" style="flex:0 1 280px">
+    <h3>Timing (ms)</h3>
+    <table>
+      <tr><td>save upload</td><td id="t_save">–</td></tr>
+      <tr><td>model load (first use)</td><td id="t_load">–</td></tr>
+      <tr><td>preprocess (GPU)</td><td id="t_pre">–</td></tr>
+      <tr><td>inference</td><td id="t_infer">–</td></tr>
+      <tr><td>encode result</td><td id="t_enc">–</td></tr>
+      <tr><td>server total</td><td id="t_srv">–</td></tr>
+      <tr class="total"><td>upload → result (browser)</td><td id="t_total">–</td></tr>
+    </table>
+    <div id="variant_used" style="margin-top:8px;color:#9aa0a6;font-size:13px"></div>
+  </div>
+</div>
+
+<script src="/js/app.js"></script>
+</body>
+</html>
