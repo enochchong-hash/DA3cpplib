@@ -4,9 +4,9 @@ Use this checklist to verify the web UI functionality before considering a relea
 
 ## Test Environment
 
-- [ ] Browser: Chrome/Edge/Firefox latest
-- [ ] Device: Desktop or mobile on same LAN as server
-- [ ] Server running: `./scripts/start_all.sh` (defaults to LAN + HTTPS; firewall opened via `sudo ./scripts/open_firewall.sh`)
+- [x] Browser: Chrome/Edge/Firefox latest
+- [x] Device: Desktop or mobile on same LAN as server
+- [x] Server running: `./scripts/start_all.sh` (defaults to LAN + HTTPS; firewall opened via `sudo ./scripts/open_firewall.sh`)
 
 ## Basic Functionality
 
@@ -72,11 +72,11 @@ Start with: `./scripts/start_server.sh`
 
 Start with: `./scripts/start_all.sh` (default) or `./scripts/start.sh --lan --daemon`
 
-- [ ] Self-signed certificate generated in `resources/certs/`
-- [ ] `https://<lan-ip>:8090` accessible
-- [ ] Certificate warning accepted once
-- [ ] Camera works on mobile after accepting cert
-- [ ] HUD shows fps/drops correctly
+- [x] Self-signed certificate generated in `resources/certs/`
+- [x] `https://<lan-ip>:8090` accessible
+- [x] Certificate warning accepted once
+- [x] Camera works on mobile after accepting cert
+- [x] HUD shows fps/drops correctly
 
 ## Error Handling
 
@@ -104,6 +104,6 @@ Record the following for each test run:
 ### 2026-07-10 — first user validation (release build)
 - Device: Android phone over LAN, `https://192.168.1.31:8090` (self-signed cert, `start_all.sh` LAN+HTTPS default, firewall opened via `open_firewall.sh`)
 - Server: RTX 5060 8 GB, CUDA 12.8, release commit d9623ef
-- Verified: page load clean (no Chrome console errors, no 404s), live camera video stream, JPG upload, variant dropdown (f32/q8/q4), all five render styles
+- Verified: `start_all.sh` default flow works on desktop (local) AND mobile over LAN; page load clean (no Chrome console errors, no 404s), live camera video stream, JPG upload, variant dropdown (f32/q8/q4), all five render styles; full TLS/LAN section (cert generation, LAN URL, cert warning once, mobile camera, HUD)
 - Not covered this run: PNG upload in UI (no PNG file available — API path covered by smoke test), click-to-choose, high-res mode, flip camera, error-handling rows
 - Anomalies: none reported
