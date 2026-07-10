@@ -1,0 +1,23 @@
+[Unit]
+Description=Depth Anything 3 Depth Estimation Service
+After=network.target
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@REL_ROOT@
+ExecStart=@REL_ROOT@/scripts/start.sh --port 8090 --daemon
+Restart=on-failure
+RestartSec=5
+
+# Environment
+Environment=DA3_MODEL_DIR=@REL_ROOT@/resources/nnmodels
+Environment=DA3_WWW_DIR=@REL_ROOT@/resources
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=da3-service
+
+[Install]
+WantedBy=multi-user.target
