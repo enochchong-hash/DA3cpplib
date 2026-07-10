@@ -1,2 +1,3 @@
-# Stop all DA3 server instances
-exec "$(dirname "$0")/stop_all.sh" "$@"
+#!/bin/bash
+# Compat alias for the old gemma4 script name.
+exec "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/stop_all.sh" "$@"

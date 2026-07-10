@@ -112,6 +112,13 @@ fi
 PIDFILE="$REL_ROOT/var/run/da3-${PORT}.pid"
 LOGFILE="$REL_ROOT/var/log/da3-${PORT}.log"
 BINARY="$REL_ROOT/build/depth-ui-server"
+mkdir -p "$REL_ROOT/var/run" "$REL_ROOT/var/log"
+
+# Probe /health over http, then https (instance may be running with --tls).
+health_ok() {
+  curl -s "http://127.0.0.1:${1}/health" &>/dev/null \
+    || curl -sk "https://127.0.0.1:${1}/health" &>/dev/null
+}
 
 # Status check
 if [ "$STATUS" -eq 1 ]; then
@@ -120,7 +127,7 @@ if [ "$STATUS" -eq 1 ]; then
     PID=$(cat "$PIDFILE")
     if kill -0 "$PID" 2>/dev/null; then
       echo "  Running (PID $PID)"
-      if curl -s "http://${HOST}:${PORT}/health" &>/dev/null; then
+      if health_ok "$PORT"; then
         echo "  Health: OK"
       else
         echo "  Health: FAILED"
@@ -158,8 +165,8 @@ if [ "$STOP" -eq 1 ]; then
   else
     echo "  No pidfile found"
   fi
-  # Fallback sweep (safe: -x matches exact binary name)
-  pkill -x depth-ui-server 2>/dev/null || true
+  # Deliberately NO pkill sweep here: --stop is scoped to this port only.
+  # To stop every instance (any port), use scripts/stop_all.sh.
   exit 0
 fi
 
@@ -188,17 +195,17 @@ if [ "$TLS" -eq 1 ]; then
     echo "Generating self-signed TLS certificate..."
     mkdir -p "$CERT_DIR"
     
-    # Get LAN IP for SAN
-    LAN_IP=$(ip route | grep default | awk '{print $9}' | head -1)
-    if [ -z "$LAN_IP" ]; then
-      LAN_IP="192.168.1.1"  # Fallback
-    fi
-    
+    # Browsers require the SAN (not CN) to match the address being visited,
+    # so the cert must carry this host's LAN IP or phones reject it outright.
+    LAN_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K[0-9.]+' || true)
+    SAN="DNS:localhost,IP:127.0.0.1${LAN_IP:+,IP:$LAN_IP}"
+
     openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
       -keyout "$KEY_FILE" \
       -out "$CERT_FILE" \
-      -subj "/CN=localhost" \
-      -addext "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:${LAN_IP}" 2>/dev/null
+      -subj "/CN=depth-ui" \
+      -addext "subjectAltName=$SAN" 2>/dev/null
+    echo "  SAN: $SAN  (if the LAN IP changes, delete resources/certs/ and relaunch)"
     
     echo "  Certificate: $CERT_FILE"
     echo "  Key: $KEY_FILE"
@@ -222,34 +229,53 @@ if [ "$NO_PREWARM" -eq 1 ]; then
   export DEPTH_UI_PREWARM=off
 fi
 
+# Fused DPT-head CUDA kernels are the default (~36 vs ~52 ms server total);
+# --conv im2col A/Bs against the stock ggml path. Precedence: --conv flag,
+# then pre-set DA_CONV env, then cuda_fused.
 if [ -n "$CONV_MODE" ]; then
   export DA_CONV="$CONV_MODE"
+else
+  export DA_CONV="${DA_CONV:-cuda_fused}"
 fi
 
-# Build command
-CMD="$BINARY $PORT"
-
 if [ "$DAEMON" -eq 1 ]; then
+  # Idempotent: if this port already has a live, healthy instance, do nothing.
+  if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+    if health_ok "$PORT"; then
+      echo "Already running on port $PORT (PID $(cat "$PIDFILE")) - nothing to do."
+      exit 0
+    fi
+    echo "ERROR: PID $(cat "$PIDFILE") is alive but /health fails on port $PORT."
+    echo "Inspect it, or stop it first: ./scripts/start.sh --port $PORT --stop"
+    exit 1
+  fi
+
   echo "Starting daemon on ${HOST}:${PORT}..."
-  nohup $CMD > "$LOGFILE" 2>&1 &
+  nohup "$BINARY" "$PORT" > "$LOGFILE" 2>&1 &
   PID=$!
   echo "$PID" > "$PIDFILE"
-  
-  # Wait for health
+
+  # Wait for health; bail out early if the process died (port taken, bad model dir...)
   for i in {1..30}; do
-    if curl -s "http://${HOST}:${PORT}/health" &>/dev/null; then
+    if ! kill -0 "$PID" 2>/dev/null; then
+      echo "ERROR: Server exited during startup. Last log lines:"
+      tail -5 "$LOGFILE" 2>/dev/null || true
+      rm -f "$PIDFILE"
+      exit 1
+    fi
+    if health_ok "$PORT"; then
       echo "  Started (PID $PID)"
       echo "  Log: $LOGFILE"
       exit 0
     fi
     sleep 0.5
   done
-  
-  echo "ERROR: Server failed to start. Check $LOGFILE"
+
+  echo "ERROR: Server failed to become healthy. Check $LOGFILE"
   rm -f "$PIDFILE"
   exit 1
 else
   echo "Starting server on ${HOST}:${PORT}..."
   echo "  Press Ctrl+C to stop"
-  exec $CMD
+  exec "$BINARY" "$PORT"
 fi

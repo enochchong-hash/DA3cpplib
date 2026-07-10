@@ -26,10 +26,11 @@ if ! command -v mkcert &>/dev/null; then
   echo "  ✓ mkcert installed to $HOME/.local/bin/mkcert"
 fi
 
-# Initialize CA if needed
-if [ ! -d "$MKCERT_DIR" ]; then
+# Initialize CA if needed (key on the CA key file, not the directory - the
+# directory existing without a CA inside would skip -install forever)
+CAROOT="$(mkcert -CAROOT)"
+if [ ! -f "$CAROOT/rootCA-key.pem" ]; then
   echo "Initializing local CA..."
-  mkdir -p "$MKCERT_DIR"
   mkcert -install
   echo "  ✓ CA installed"
 fi
@@ -39,14 +40,16 @@ mkdir -p "$CERT_DIR"
 
 HOSTS=("localhost" "127.0.0.1")
 
-# Add LAN IP
-LAN_IP=$(ip route | grep default | awk '{print $9}' | head -1)
+# Add LAN IP (SAN must match the address the client visits; CN is ignored)
+LAN_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K[0-9.]+' || true)
 if [ -n "$LAN_IP" ]; then
   HOSTS+=("$LAN_IP")
 fi
 
-# Add extra hosts from args
-HOSTS+=("${@:-}")
+# Add extra hosts from args (if any)
+if [ $# -gt 0 ]; then
+  HOSTS+=("$@")
+fi
 
 echo "Generating certificate for: ${HOSTS[*]}"
 
@@ -55,12 +58,16 @@ rm -f "$CERT_DIR/server.crt" "$CERT_DIR/server.key"
 
 mkcert -cert-file "$CERT_DIR/server.crt" -key-file "$CERT_DIR/server.key" "${HOSTS[@]}"
 
+# Public half of the CA, for import on phones/other devices. The CA PRIVATE
+# key stays in $CAROOT and must never be copied or committed.
+cp "$CAROOT/rootCA.pem" "$CERT_DIR/rootCA.pem"
+
 echo ""
 echo "✓ TLS certificates generated:"
 echo "  Certificate: $CERT_DIR/server.crt"
 echo "  Key:         $CERT_DIR/server.key"
+echo "  CA (public): $CERT_DIR/rootCA.pem  <- import this on each browsing device"
 echo ""
-echo "To use with the server:"
-echo "  export DEPTH_UI_CERT=$CERT_DIR/server.crt"
-echo "  export DEPTH_UI_KEY=$CERT_DIR/server.key"
-echo "  ./scripts/start.sh --tls"
+echo "Then start the server with:  ./scripts/start.sh --lan"
+echo "(--tls picks up server.crt/server.key automatically; certs are loaded"
+echo " at startup only - restart the server after regenerating them)"

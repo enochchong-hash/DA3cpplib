@@ -25,28 +25,29 @@ download_and_verify() {
   
   mkdir -p "$MODEL_DIR/$variant"
   
+  # Integer arithmetic: |actual - expected| <= 5% of expected (no bc needed)
+  local tolerance=$((expected_size / 20))
+
   if [ -f "$dest" ]; then
-    local actual_size
+    local actual_size delta
     actual_size=$(stat -c%s "$dest" 2>/dev/null || echo 0)
-    local diff_pct
-    diff_pct=$(echo "scale=2; 100 * ($actual_size - $expected_size) / $expected_size" | bc)
-    if [[ "${diff_pct#-}" -le 5 ]]; then
+    delta=$((actual_size - expected_size))
+    if [ "${delta#-}" -le "$tolerance" ]; then
       echo "  ✓ $variant/$filename already exists and valid (${actual_size} bytes)"
       return 0
     fi
     echo "  ! $variant/$filename exists but size mismatch, re-downloading..."
     rm -f "$dest"
   fi
-  
+
   echo "  Downloading $variant/$filename..."
   curl -L --fail --continue-at - -o "$dest" "$HF_BASE/$filename"
-  
+
   # Verify size
-  local actual_size
+  local actual_size delta
   actual_size=$(stat -c%s "$dest")
-  local diff_pct
-  diff_pct=$(echo "scale=2; 100 * ($actual_size - $expected_size) / $expected_size" | bc)
-  if [[ "${diff_pct#-}" -gt 5 ]]; then
+  delta=$((actual_size - expected_size))
+  if [ "${delta#-}" -gt "$tolerance" ]; then
     echo "ERROR: $variant/$filename size mismatch: expected ~$expected_size, got $actual_size"
     exit 1
   fi

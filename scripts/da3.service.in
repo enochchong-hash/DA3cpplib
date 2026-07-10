@@ -6,7 +6,10 @@ After=network.target
 Type=simple
 User=@USER@
 WorkingDirectory=@REL_ROOT@
-ExecStart=@REL_ROOT@/scripts/start.sh --port 8090 --daemon
+# Foreground mode: start.sh exec's the binary, so systemd tracks the real
+# process. Do NOT add --daemon here - Type=simple would see the fork parent
+# exit and restart-loop the service.
+ExecStart=@REL_ROOT@/scripts/start.sh --port 8090
 Restart=on-failure
 RestartSec=5
 

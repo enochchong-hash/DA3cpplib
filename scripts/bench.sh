@@ -3,20 +3,21 @@
 #
 # Usage: ./bench.sh [options]
 #   --variant q8       Model variant (default: q8)
-#   --n 20             Number of requests (default: 20)
-#   --warmup 3         Warmup requests (default: 3)
+#   --n 20             Number of measured requests (default: 20)
+#   --warmup 3         Warmup requests, discarded (default: 3)
 #   --res std          Resolution: std|full (default: std)
 #   --port 8090        Server port (default: 8090)
-#   --image PATH       Test image (default: desk.jpg from engine)
-#   --json             Output machine-readable JSON
-#   --spawn            Spawn server automatically if not running
+#   --image PATH       Test image (default: desk.jpg from engine assets)
+#   --json             Output machine-readable JSON only (for perf-baselines.md)
+#   --spawn            Spawn a server if none is running, kill it afterwards
+#
+# Timings come from the X-Timings-Ms response header (the default /depth
+# response is binary JPEG; there is no JSON body to parse).
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REL_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-
-cd "$REL_ROOT"
 
 VARIANT="q8"
 N=20
@@ -26,55 +27,47 @@ PORT=8090
 IMAGE="$REL_ROOT/3rdparty/depth-anything.cpp/assets/samples/desk.jpg"
 JSON_OUTPUT=0
 SPAWN=0
+SPAWN_PID=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --variant)
-      VARIANT="$2"
-      shift 2
-      ;;
-    --n)
-      N="$2"
-      shift 2
-      ;;
-    --warmup)
-      WARMUP="$2"
-      shift 2
-      ;;
-    --res)
-      RES="$2"
-      shift 2
-      ;;
-    --port)
-      PORT="$2"
-      shift 2
-      ;;
-    --image)
-      IMAGE="$2"
-      shift 2
-      ;;
-    --json)
-      JSON_OUTPUT=1
-      shift
-      ;;
-    --spawn)
-      SPAWN=1
-      shift
-      ;;
-    *)
-      echo "Unknown option: $1"
-      exit 1
-      ;;
+    --variant) VARIANT="$2"; shift 2 ;;
+    --n)       N="$2"; shift 2 ;;
+    --warmup)  WARMUP="$2"; shift 2 ;;
+    --res)     RES="$2"; shift 2 ;;
+    --port)    PORT="$2"; shift 2 ;;
+    --image)   IMAGE="$2"; shift 2 ;;
+    --json)    JSON_OUTPUT=1; shift ;;
+    --spawn)   SPAWN=1; shift ;;
+    --help)    sed -n '2,16p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    *) echo "Unknown option: $1 (see --help)"; exit 1 ;;
   esac
 done
+
+URL="http://localhost:$PORT/depth?variant=$VARIANT&res=$RES"
+
+cleanup() {
+  if [ -n "$SPAWN_PID" ]; then
+    kill "$SPAWN_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+
+log() { [ "$JSON_OUTPUT" -eq 1 ] || echo "$@"; }
 
 # Check server running
 if ! curl -s "http://localhost:$PORT/health" &>/dev/null; then
   if [ "$SPAWN" -eq 1 ]; then
-    echo "Server not running, spawning on port $PORT..."
-    "$REL_ROOT/build/depth-ui-server" "$PORT" &
+    log "Server not running, spawning on port $PORT..."
+    # Bench the shipped configuration: fused kernels unless caller overrides.
+    DA_CONV="${DA_CONV:-cuda_fused}" "$REL_ROOT/build/depth-ui-server" "$PORT" \
+      > /dev/null 2>&1 &
     SPAWN_PID=$!
-    sleep 3
+    for i in {1..30}; do
+      curl -s "http://localhost:$PORT/health" &>/dev/null && break
+      kill -0 "$SPAWN_PID" 2>/dev/null || { echo "ERROR: spawned server died"; exit 1; }
+      sleep 0.5
+    done
   else
     echo "ERROR: Server not running on port $PORT"
     echo "Use --spawn to auto-spawn, or start with ./scripts/start.sh"
@@ -82,108 +75,78 @@ if ! curl -s "http://localhost:$PORT/health" &>/dev/null; then
   fi
 fi
 
-# Warmup
-echo "Running $WARMUP warmup requests..."
-for i in $(seq 1 $WARMUP); do
-  curl -s -X POST --data-binary @"$IMAGE" \
-    -H "Content-Type: image/jpeg" \
-    "http://localhost:$PORT/depth?variant=$VARIANT&res=$RES" &>/dev/null
+# One request -> one CSV line "save,model_load,preprocess,infer,encode,server"
+measure_one() {
+  local hdr code timings
+  hdr=$(mktemp)
+  code=$(curl -s -o /dev/null -D "$hdr" -w '%{http_code}' -X POST \
+    --data-binary @"$IMAGE" -H "Content-Type: image/jpeg" "$URL")
+  if [ "$code" != "200" ]; then
+    rm -f "$hdr"; echo "ERROR: request failed with HTTP $code" >&2; return 1
+  fi
+  timings=$(grep -i '^x-timings-ms:' "$hdr" | sed 's/^[^:]*: *//' | tr -d '\r')
+  rm -f "$hdr"
+  if [ -z "$timings" ]; then
+    echo "ERROR: no X-Timings-Ms header in response" >&2; return 1
+  fi
+  echo "$timings" | grep -oE '"(save|model_load|preprocess|infer|encode|server)_ms":[0-9.]+' \
+    | cut -d: -f2 | paste -sd, -
+}
+
+log "Running $WARMUP warmup requests..."
+for i in $(seq 1 "$WARMUP"); do
+  curl -s -o /dev/null -X POST --data-binary @"$IMAGE" \
+    -H "Content-Type: image/jpeg" "$URL"
 done
 
-# Benchmark
-echo "Running $N benchmark requests..."
-TIMINGS=()
-for i in $(seq 1 $N); do
-  RESPONSE=$(curl -s -w "\n%{http_code}" -X POST --data-binary @"$IMAGE" \
-    -H "Content-Type: image/jpeg" \
-    "http://localhost:$PORT/depth?variant=$VARIANT&res=$RES")
-  HTTP_CODE=$(echo "$RESPONSE" | tail -1)
-  BODY=$(echo "$RESPONSE" | head -n -1)
-  
-  if [ "$HTTP_CODE" != "200" ]; then
-    echo "ERROR: Request $i failed with HTTP $HTTP_CODE"
-    exit 1
-  fi
-  
-  # Extract timings from header or JSON
-  TIMING=$(echo "$BODY" | grep -o '"server_ms":[0-9.]*' | cut -d: -f2)
-  if [ -n "$TIMING" ]; then
-    TIMINGS+=("$TIMING")
-  fi
+log "Running $N benchmark requests..."
+SAMPLES=$(mktemp)
+for i in $(seq 1 "$N"); do
+  measure_one >> "$SAMPLES"
 done
 
-# Calculate stats
-echo ""
-echo "=== Results ==="
-echo "Variant: $VARIANT, Resolution: $RES, N: $N"
-echo ""
-
-# Use awk for statistics
-STATS=$(printf '%s\n' "${TIMINGS[@]}" | awk '
+# Per-stage stats: field order matches measure_one's grep order
+# (save, model_load, preprocess, infer, encode, server)
+STATS=$(awk -F, '
 {
-  vals[NR] = $1
-  sum += $1
-  if (NR == 1 || $1 < min) min = $1
-  if (NR == 1 || $1 > max) max = $1
+  for (f = 1; f <= NF; f++) vals[f, NR] = $f + 0
+  n = NR
 }
 END {
-  n = NR
-  median_idx = int((n + 1) / 2)
-  p95_idx = int(n * 0.95)
-  if (p95_idx < 1) p95_idx = 1
-  
-  # Sort for percentiles
-  for (i = 1; i <= n; i++) {
-    for (j = i + 1; j <= n; j++) {
-      if (vals[i] > vals[j]) {
-        tmp = vals[i]
-        vals[i] = vals[j]
-        vals[j] = tmp
-      }
+  split("save model_load preprocess infer encode server", names, " ")
+  for (f = 1; f <= 6; f++) {
+    # insertion sort of column f
+    for (i = 2; i <= n; i++) {
+      v = vals[f, i]
+      for (j = i - 1; j >= 1 && vals[f, j] > v; j--) vals[f, j + 1] = vals[f, j]
+      vals[f, j + 1] = v
     }
+    med = vals[f, int((n + 1) / 2)]
+    p95i = int(n * 0.95); if (p95i < 1) p95i = 1
+    printf "%s %.1f %.1f %.1f %.1f\n", names[f], med, vals[f, 1], vals[f, n], vals[f, p95i]
   }
-  
-  median = vals[median_idx]
-  p95 = vals[p95_idx]
-  avg = sum / n
-  
-  printf "%.1f %.1f %.1f %.1f %.1f\n", median, min, max, p95, avg
-}')
+}' "$SAMPLES")
+rm -f "$SAMPLES"
 
-read MEDIAN MIN MAX P95 AVG <<< "$STATS"
-
-echo "Server total (ms):"
-echo "  Median: $MEDIAN"
-echo "  Min:    $MIN"
-echo "  Max:    $MAX"
-echo "  P95:    $P95"
-echo "  Avg:    $AVG"
-echo ""
-echo "Derived fps: $(awk "BEGIN {printf \"%.1f\", 1000 / $MEDIAN}")"
+SERVER_MEDIAN=$(echo "$STATS" | awk '$1 == "server" {print $2}')
+FPS=$(awk "BEGIN {printf \"%.1f\", 1000 / $SERVER_MEDIAN}")
 
 if [ "$JSON_OUTPUT" -eq 1 ]; then
+  {
+    echo "{"
+    echo "  \"date\": \"$(date -Iseconds)\","
+    echo "  \"variant\": \"$VARIANT\", \"resolution\": \"$RES\", \"n\": $N, \"warmup\": $WARMUP,"
+    echo "  \"stages_ms\": {"
+    echo "$STATS" | awk '{printf "    \"%s\": {\"median\": %s, \"min\": %s, \"max\": %s, \"p95\": %s},\n", $1, $2, $3, $4, $5}' | sed '$ s/,$//'
+    echo "  },"
+    echo "  \"fps\": $FPS"
+    echo "}"
+  }
+else
   echo ""
-  echo "=== JSON Output ==="
-  cat <<EOF
-{
-  "date": "$(date -Iseconds)",
-  "variant": "$VARIANT",
-  "resolution": "$RES",
-  "n": $N,
-  "warmup": $WARMUP,
-  "server_ms": {
-    "median": $MEDIAN,
-    "min": $MIN,
-    "max": $MAX,
-    "p95": $P95,
-    "avg": $AVG
-  },
-  "fps": $(awk "BEGIN {printf \"%.1f\", 1000 / $MEDIAN}")
-}
-EOF
-fi
-
-# Cleanup spawned server
-if [ "${SPAWN_PID:-}" != "" ]; then
-  kill "$SPAWN_PID" 2>/dev/null || true
+  echo "=== Results (variant=$VARIANT res=$RES n=$N) ==="
+  printf "%-12s %8s %8s %8s %8s\n" "stage" "median" "min" "max" "p95"
+  echo "$STATS" | awk '{printf "%-12s %8s %8s %8s %8s\n", $1, $2, $3, $4, $5}'
+  echo ""
+  echo "Sequential fps (1000/server-median): $FPS"
 fi
