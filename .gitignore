@@ -1,0 +1,29 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+
+# Runtime state
+var/log/*
+var/run/*
+!var/log/.gitkeep
+!var/run/.gitkeep
+
+# Models (gitignored, downloaded by download_models.sh)
+resources/nnmodels/**/*.gguf
+!resources/nnmodels/.gitkeep
+
+# TLS certificates (runtime-generated)
+resources/certs/*
+!resources/certs/.gitkeep
+
+# Logs
+*.log
+
+# Editor/IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
