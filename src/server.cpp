@@ -28,6 +28,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <filesystem>
 #include <memory>
 #include <cstdio>
 #include <cstring>
@@ -46,25 +47,43 @@ double ms_since(clk::time_point t0) {
     return std::chrono::duration<double, std::milli>(clk::now() - t0).count();
 }
 
-// Helper to get model directory from env or compile-time default
-std::string model_dir() {
-    const char* env = getenv("DA3_MODEL_DIR");
+// Directory containing this executable (empty on failure).
+std::string exe_dir() {
+    char buf[4096];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n <= 0) return {};
+    buf[n] = '\0';
+    return std::filesystem::path(buf).parent_path().string();
+}
+
+// Resource resolution, in order: env var; <exe>/../<rel> (binary in build/,
+// resources/ beside it -- keeps the whole tree relocatable and submodule-
+// friendly); compile-time default (build-host fallback for unusual layouts).
+std::string resource_dir(const char* env_var, const char* rel, const char* compiled) {
+    const char* env = getenv(env_var);
     if (env && *env) return env;
+    std::string exe = exe_dir();
+    if (!exe.empty()) {
+        std::filesystem::path p = std::filesystem::path(exe).parent_path() / rel;
+        std::error_code ec;
+        if (std::filesystem::is_directory(p, ec)) return p.lexically_normal().string();
+    }
+    return compiled;
+}
+
+std::string model_dir() {
 #ifdef DA3_DEFAULT_MODEL_DIR
-    return DA3_DEFAULT_MODEL_DIR;
+    return resource_dir("DA3_MODEL_DIR", "resources/nnmodels", DA3_DEFAULT_MODEL_DIR);
 #else
-    return "resources/nnmodels";
+    return resource_dir("DA3_MODEL_DIR", "resources/nnmodels", "resources/nnmodels");
 #endif
 }
 
-// Helper to get WWW directory from env or compile-time default
 std::string www_dir() {
-    const char* env = getenv("DA3_WWW_DIR");
-    if (env && *env) return env;
 #ifdef DA3_DEFAULT_WWW_DIR
-    return DA3_DEFAULT_WWW_DIR;
+    return resource_dir("DA3_WWW_DIR", "resources", DA3_DEFAULT_WWW_DIR);
 #else
-    return "resources";
+    return resource_dir("DA3_WWW_DIR", "resources", "resources");
 #endif
 }
 

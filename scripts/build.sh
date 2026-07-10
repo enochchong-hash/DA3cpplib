@@ -14,6 +14,9 @@ REL_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 cd "$REL_ROOT"
 
+# Prefer /usr/local/cuda* over any PATH nvcc (Ubuntu's apt package is 11.5).
+source "$SCRIPT_DIR/cuda_env.sh"
+
 ARCH="native"
 BUILD_TYPE="Release"
 CLEAN=0
@@ -71,6 +74,6 @@ echo ""
 echo "=== Build complete ==="
 echo "Artifacts:"
 echo "  Server:   $BUILD_DIR/depth-ui-server"
-echo "  CLI tool: $BUILD_DIR/da3-cli (if DA_BUILD_CLI=ON)"
+echo "  CLI tool: $BUILD_DIR/3rdparty/depth-anything.cpp/examples/cli/da3-cli"
 echo ""
 echo "To run: ./scripts/start.sh"

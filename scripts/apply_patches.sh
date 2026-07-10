@@ -5,7 +5,7 @@
 #
 # This script:
 # 1. Initializes submodules if needed
-# 2. Applies ggml patch first, then engine patches
+# 2. Applies ggml patch first, then engine patches (engine code needs patched ggml)
 # 3. Is idempotent - safe to run multiple times
 #
 # IMPORTANT: Running `git submodule update --checkout --force` will discard patches.
@@ -22,106 +22,81 @@ cd "$REL_ROOT"
 echo "=== Applying patches to submodules ==="
 
 # Initialize submodules if needed
-if [ ! -d "3rdparty/depth-anything.cpp/.git" ]; then
+if [ ! -e "3rdparty/depth-anything.cpp/.git" ]; then
     echo "Initializing submodules..."
     git submodule update --init
+fi
+if [ ! -e "3rdparty/depth-anything.cpp/third_party/ggml/.git" ]; then
+    echo "Initializing nested ggml submodule..."
     git -C 3rdparty/depth-anything.cpp submodule update --init --recursive
 fi
 
-# Function to check if patches are already applied
-check_patches_applied() {
-    local repo_dir="$1"
-    local pin="$2"
-    local patch_dir="$3"
-    
-    cd "$repo_dir"
-    
-    # Get list of patch subjects
-    local applied_commits
-    applied_commits=$(git log --format="%s" "$pin..HEAD" 2>/dev/null || echo "")
-    
-    for patch in "$patch_dir"/*.patch; do
-        [ -f "$patch" ] || continue
-        local subject
-        subject=$(grep "^Subject:" "$patch" | sed 's/Subject: \[PATCH\] //')
-        
-        if echo "$applied_commits" | grep -qF "$subject"; then
-            echo "  ✓ Already applied: $subject"
-        else
-            return 1
+# apply_patch_set <name> <repo_dir> <upstream_pin> <patch_dir>
+#
+# Counts how many of the patch subjects already exist as commits above the
+# upstream pin: all -> skip (idempotent), none -> apply, some -> abort
+# (partial state needs a human). No HEAD-vs-pin comparison needed.
+apply_patch_set() {
+    local name="$1" repo_dir="$2" pin="$3" patch_dir="$4"
+    local patches=("$patch_dir"/*.patch)
+
+    if [ ! -f "${patches[0]}" ]; then
+        echo "ERROR: no patch files in $patch_dir"
+        return 1
+    fi
+
+    local applied_subjects found=0 total=0 subject
+    applied_subjects=$(git -C "$repo_dir" log --format='%s' "$pin..HEAD")
+    for patch in "${patches[@]}"; do
+        total=$((total + 1))
+        subject=$(grep -m1 '^Subject:' "$patch" | sed 's/^Subject: \(\[PATCH[^]]*\] \)\?//')
+        if grep -qxF "$subject" <<< "$applied_subjects"; then
+            found=$((found + 1))
         fi
     done
-    
-    cd "$REL_ROOT"
-    return 0
+
+    if [ "$found" -eq "$total" ]; then
+        echo "  $name: all $total patch(es) already applied"
+        return 0
+    fi
+    if [ "$found" -gt 0 ]; then
+        echo "ERROR: $name has $found of $total patches applied - partial state."
+        echo "  Inspect: git -C $repo_dir log --oneline $pin..HEAD"
+        echo "  To reset to upstream: git -C $repo_dir reset --hard $pin  (then re-run)"
+        return 1
+    fi
+
+    # --ignore-submodules: a patched nested submodule (ggml) legitimately moves
+    # its gitlink; only real file modifications should block git am.
+    if ! git -C "$repo_dir" diff --quiet --ignore-submodules=all \
+       || ! git -C "$repo_dir" diff --cached --quiet --ignore-submodules=all; then
+        echo "ERROR: $name working tree is dirty. Commit or stash changes first."
+        return 1
+    fi
+
+    echo "  $name: applying $total patch(es)..."
+    if ! git -C "$repo_dir" -c user.name="da3-release" -c user.email="da3-release@local" \
+            am --3way "${patches[@]}"; then
+        echo "ERROR: git am failed for $name (see message above)."
+        echo "  Clean up with: git -C $repo_dir am --abort"
+        return 1
+    fi
+    echo "  ✓ $name patches applied"
 }
 
-# Apply ggml patch first
 echo ""
-echo "Applying ggml patch..."
-GGML_DIR="3rdparty/depth-anything.cpp/third_party/ggml"
-GGML_PATCH_DIR="$PATCH_DIR/ggml"
-GGML_PIN="3af5f57"
+GGML_DIR="$REL_ROOT/3rdparty/depth-anything.cpp/third_party/ggml"
+ENGINE_DIR="$REL_ROOT/3rdparty/depth-anything.cpp"
 
-cd "$GGML_DIR"
-current_commit=$(git rev-parse HEAD)
-if [ "$current_commit" = "$GGML_PIN" ]; then
-    echo "  ggml at upstream pin $GGML_PIN"
-elif ! check_patches_applied "$GGML_DIR" "$GGML_PIN" "$GGML_PATCH_DIR" 2>/dev/null; then
-    # Clean tree check
-    if ! git diff --quiet || ! git diff --cached --quiet; then
-        echo "ERROR: ggml working tree is dirty. Commit or stash changes first."
-        exit 1
-    fi
-    
-    echo "  Applying ggml patches..."
-    git -c user.name="da3-release" -c user.email="da3-release@local" am --3way "$GGML_DIR"/*.patch 2>/dev/null || {
-        echo "ERROR: Failed to apply ggml patches. Manual intervention required."
-        exit 1
-    }
-    echo "  ✓ ggml patches applied"
-else
-    echo "  ggml patches already applied"
-fi
-echo "  Current ggml state: $(git log --oneline -1)"
-cd "$REL_ROOT"
-
-# Apply engine patches
-echo ""
-echo "Applying depth-anything.cpp patches..."
-ENGINE_DIR="3rdparty/depth-anything.cpp"
-ENGINE_PATCH_DIR="$PATCH_DIR/depth-anything.cpp"
-ENGINE_PIN="f4e17de"
-
-cd "$ENGINE_DIR"
-current_commit=$(git rev-parse HEAD)
-if [ "$current_commit" = "$ENGINE_PIN" ]; then
-    echo "  Engine at upstream pin $ENGINE_PIN"
-elif ! check_patches_applied "$ENGINE_DIR" "$ENGINE_PIN" "$ENGINE_PATCH_DIR" 2>/dev/null; then
-    # Clean tree check
-    if ! git diff --quiet || ! git diff --cached --quiet; then
-        echo "ERROR: Engine working tree is dirty. Commit or stash changes first."
-        exit 1
-    fi
-    
-    echo "  Applying engine patches..."
-    git -c user.name="da3-release" -c user.email="da3-release@local" am --3way "$ENGINE_PATCH_DIR"/*.patch 2>/dev/null || {
-        echo "ERROR: Failed to apply engine patches. Manual intervention required."
-        exit 1
-    }
-    echo "  ✓ Engine patches applied"
-else
-    echo "  Engine patches already applied"
-fi
-echo "  Current engine state: $(git log --oneline -1)"
-cd "$REL_ROOT"
+apply_patch_set "ggml"   "$GGML_DIR"   3af5f57 "$PATCH_DIR/ggml"
+apply_patch_set "engine" "$ENGINE_DIR" f4e17de "$PATCH_DIR/depth-anything.cpp"
 
 echo ""
 echo "=== Patch application complete ==="
 echo ""
 echo "Final state:"
-echo "  ggml:     $(git -C $GGML_DIR log --oneline -1 --format='%H %s')"
-echo "  engine:   $(git -C $ENGINE_DIR log --oneline -1 --format='%H %s')"
+echo "  ggml:   $(git -C "$GGML_DIR" log --oneline --format='%h %s' -1)"
+echo "  engine: $(git -C "$ENGINE_DIR" log --oneline --format='%h %s' -1)"
 echo ""
-echo "Note: The submodule gitlink will show as dirty in the release repo."
-echo "This is expected - the patches modify the upstream-pinned submodules."
+echo "Note: the submodule gitlink shows as modified in the release repo after"
+echo "patching - expected; the patches sit on top of the upstream-pinned SHAs."

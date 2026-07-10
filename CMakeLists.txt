@@ -22,6 +22,11 @@ set(GGML_CUDA_GRAPHS ON CACHE BOOL "Enable ggml CUDA graphs" FORCE)
 # Add engine subdirectory (once)
 add_subdirectory(3rdparty/depth-anything.cpp)
 
+# Imported targets found inside the engine subproject are directory-scoped;
+# the server target needs its own find_package for CUDA::cudart/nvjpeg + Threads.
+find_package(CUDAToolkit REQUIRED)
+find_package(Threads REQUIRED)
+
 # Find OpenSSL for httplib TLS support
 find_package(OpenSSL QUIET)
 if(OpenSSL_FOUND)
@@ -55,8 +60,11 @@ target_include_directories(depth-ui-server PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/cpp-httplib
 )
 
-# Compile-time defaults (overridden by env vars at runtime)
+# Compile-time defaults: LAST-RESORT fallback only. At runtime the server
+# prefers $DA3_MODEL_DIR/$DA3_WWW_DIR env vars, then <exe>/../resources
+# (relocatable). CMAKE_CURRENT_SOURCE_DIR (not CMAKE_SOURCE_DIR) so the paths
+# stay correct when this project is consumed via add_subdirectory().
 target_compile_definitions(depth-ui-server PRIVATE
-  DA3_DEFAULT_MODEL_DIR="${CMAKE_SOURCE_DIR}/resources/nnmodels"
-  DA3_DEFAULT_WWW_DIR="${CMAKE_SOURCE_DIR}/resources"
+  DA3_DEFAULT_MODEL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/resources/nnmodels"
+  DA3_DEFAULT_WWW_DIR="${CMAKE_CURRENT_SOURCE_DIR}/resources"
 )
