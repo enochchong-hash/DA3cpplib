@@ -1,0 +1,250 @@
+From 0cd94f068991142c8864f593d1bda43ed34365f3 Mon Sep 17 00:00:00 2001
+From: Enoch Chong <enoch.chong@devolrobots.com>
+Date: Fri, 3 Jul 2026 09:52:05 +0800
+Subject: [PATCH 1/3] jpeg encode decode
+
+---
+ src/backend.cpp       | 21 +++++++++++++++++++++
+ src/backend.hpp       |  9 +++++++++
+ src/dino_backbone.cpp | 19 +++++++++++++++++--
+ src/dino_backbone.hpp | 11 +++++++++++
+ src/engine.cpp        | 41 +++++++++++++++++++++++++++++++++++++++++
+ src/engine.hpp        | 10 ++++++++++
+ 6 files changed, 109 insertions(+), 2 deletions(-)
+
+diff --git a/src/backend.cpp b/src/backend.cpp
+index 4e98c20..351c631 100644
+--- a/src/backend.cpp
++++ b/src/backend.cpp
+@@ -41,6 +41,9 @@ struct Backend::Impl {
+     // into the allocated tensors after the graph is allocated, then cleared.
+     // Never overlaps across calls (compute is not re-entrant).
+     std::vector<PendingInput>   pending;
++    // Inputs whose data is provided by a callback after allocation (device-
++    // resident inputs, see add_graph_input_nd_upload). Cleared like `pending`.
++    std::vector<std::pair<ggml_tensor*, std::function<void(ggml_tensor*)>>> pending_custom;
+     // Extra tensors to read back after compute (registered via capture()).
+     std::vector<PendingCapture> captures;
+     // Extra graph roots to expand (registered via add_graph_root()) but NOT read
+@@ -192,6 +195,15 @@ ggml_tensor* Backend::add_int32_input_nd(ggml_context* ctx, GraphInputPool& pool
+     return t;
+ }
+ 
++ggml_tensor* Backend::add_graph_input_nd_upload(ggml_context* ctx, const int64_t* ne,
++                                                int n_dims,
++                                                std::function<void(ggml_tensor*)> upload) {
++    ggml_tensor* t = ggml_new_tensor(ctx, GGML_TYPE_F32, n_dims, ne);
++    ggml_set_input(t);
++    impl_->pending_custom.emplace_back(t, std::move(upload));
++    return t;
++}
++
+ void Backend::capture(ggml_tensor* t, std::vector<float>* dst) {
+     impl_->captures.push_back({t, dst});
+ }
+@@ -228,12 +240,14 @@ bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
+     // Reset registrations for this compute, then run the build lambda. The build
+     // lambda registers host inputs / captures via member calls on this Backend.
+     impl_->pending.clear();
++    impl_->pending_custom.clear();
+     impl_->captures.clear();
+     impl_->roots.clear();
+     struct ggml_tensor* output = build(ctx);
+     if (!output) {
+         DA_LOG("Backend::compute: build() returned null output tensor");
+         impl_->pending.clear();
++        impl_->pending_custom.clear();
+         impl_->captures.clear();
+         impl_->roots.clear();
+         ggml_free(ctx);
+@@ -285,6 +299,7 @@ bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
+             if (!impl_->sched) {
+                 DA_LOG("Backend::compute: ggml_backend_sched_new failed");
+                 impl_->pending.clear();
++                impl_->pending_custom.clear();
+                 impl_->captures.clear();
+                 impl_->roots.clear();
+                 ggml_free(ctx);
+@@ -305,6 +320,7 @@ bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
+             if (!impl_->galloc) {
+                 DA_LOG("Backend::compute: ggml_gallocr_new failed");
+                 impl_->pending.clear();
++                impl_->pending_custom.clear();
+                 impl_->captures.clear();
+                 impl_->roots.clear();
+                 ggml_free(ctx);
+@@ -316,6 +332,7 @@ bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
+     }
+     if (!alloc_ok) {
+         impl_->pending.clear();
++        impl_->pending_custom.clear();
+         impl_->captures.clear();
+         impl_->roots.clear();
+         ggml_free(ctx);
+@@ -327,6 +344,10 @@ bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
+         ggml_backend_tensor_set(pi.tensor, pi.host, 0, pi.nbytes);
+     }
+     impl_->pending.clear();
++    for (auto& pc : impl_->pending_custom) {
++        pc.second(pc.first);
++    }
++    impl_->pending_custom.clear();
+ 
+     enum ggml_status status = need_sched
+         ? ggml_backend_sched_graph_compute(impl_->sched, gf)
+diff --git a/src/backend.hpp b/src/backend.hpp
+index 9e396d8..53aa5fe 100644
+--- a/src/backend.hpp
++++ b/src/backend.hpp
+@@ -63,6 +63,15 @@ public:
+     // Register an N-D I32 input tensor (e.g. RoPE positions). prod(ne)=n total ints.
+     ggml_tensor* add_int32_input_nd(ggml_context* ctx, GraphInputPool& pool,
+                                     const int32_t* host, const int64_t* ne, int n_dims);
++    // Register an N-D F32 input whose data is written by `upload`, invoked with
++    // the tensor AFTER graph allocation (->buffer/->data valid) instead of the
++    // host-memcpy ggml_backend_tensor_set path. Enables device-resident inputs:
++    // the callback may fill tensor->data directly (e.g. a cudaMemcpy D2D from a
++    // GPU preprocessing pipeline) without staging through host memory. The
++    // callback must check ggml_backend_buffer_is_host(t->buffer) if it cannot
++    // guarantee the tensor landed on the device.
++    ggml_tensor* add_graph_input_nd_upload(ggml_context* ctx, const int64_t* ne,
++                                    int n_dims, std::function<void(ggml_tensor*)> upload);
+     // Build -> alloc (persistent gallocr) -> upload inputs -> compute -> read output.
+     bool compute(const std::function<ggml_tensor*(ggml_context*)>& build,
+                  std::vector<float>& out);
+diff --git a/src/dino_backbone.cpp b/src/dino_backbone.cpp
+index e114f21..be8fdbf 100644
+--- a/src/dino_backbone.cpp
++++ b/src/dino_backbone.cpp
+@@ -215,6 +215,22 @@ bool DinoBackbone::forward(const std::vector<float>& input_chw, int H, int W,
+ 
+ bool DinoBackbone::build_feats_graph(ggml_context* ctx, const std::vector<float>& input_chw,
+                                      int H, int W, GraphInputPool& pool, ggml_tensor* out_feat[4]){
++    const int64_t ine[4]={W,H,3,1};
++    return build_feats_graph_impl(ctx,
++        [&](ggml_context* c){ return be_.add_graph_input_nd(c, pool, input_chw.data(), ine, 4); },
++        H, W, pool, out_feat);
++}
++bool DinoBackbone::build_feats_graph_pre(ggml_context* ctx,
++                                     const std::function<void(ggml_tensor*)>& upload_img,
++                                     int H, int W, GraphInputPool& pool, ggml_tensor* out_feat[4]){
++    const int64_t ine[4]={W,H,3,1};
++    return build_feats_graph_impl(ctx,
++        [&](ggml_context* c){ return be_.add_graph_input_nd_upload(c, ine, 4, upload_img); },
++        H, W, pool, out_feat);
++}
++bool DinoBackbone::build_feats_graph_impl(ggml_context* ctx,
++                                     const std::function<ggml_tensor*(ggml_context*)>& make_img,
++                                     int H, int W, GraphInputPool& pool, ggml_tensor* out_feat[4]){
+     const auto& c = ml_.config();
+     if (!c.cat_token) return false;   // fused path is the cat_token=true (BASE/giant) case only
+     const int patch=(int)c.patch_size, gh=H/patch, gw=W/patch;
+@@ -243,8 +259,7 @@ bool DinoBackbone::build_feats_graph(ggml_context* ctx, const std::vector<float>
+     ggml_tensor* nb = ml_.tensor("vit.norm.bias");
+ 
+     // --- prepare tokens (same graph as forward()) ---
+-    const int64_t ine[4]={W,H,3,1};
+-    ggml_tensor* img = be_.add_graph_input_nd(ctx, pool, input_chw.data(), ine, 4);
++    ggml_tensor* img = make_img(ctx);
+     ggml_tensor* x = ggml_conv_2d(ctx, ml_.tensor("vit.patch_embed.weight"), img, patch,patch,0,0,1,1);
+     x = ggml_reshape_2d(ctx, x, (int64_t)Npatch, embed);
+     x = ggml_cont(ctx, ggml_transpose(ctx, x));
+diff --git a/src/dino_backbone.hpp b/src/dino_backbone.hpp
+index 4dcf691..c2be068 100644
+--- a/src/dino_backbone.hpp
++++ b/src/dino_backbone.hpp
+@@ -36,7 +36,18 @@ public:
+     // the caller's compute() ctx/pool (engine fuses this with the DPT head graph).
+     bool build_feats_graph(ggml_context* ctx, const std::vector<float>& input_chw,
+                            int H, int W, GraphInputPool& pool, ggml_tensor* out_feat[4]);
++    // Same fused graph, but the [W,H,3,1] image input is filled by `upload_img`
++    // after allocation (Backend::add_graph_input_nd_upload) instead of copied
++    // from a host CHW buffer -- for device-resident preprocessed inputs.
++    bool build_feats_graph_pre(ggml_context* ctx,
++                               const std::function<void(ggml_tensor*)>& upload_img,
++                               int H, int W, GraphInputPool& pool, ggml_tensor* out_feat[4]);
+ private:
++    // Shared body of the two build_feats_graph variants: `make_img` returns the
++    // registered [W,H,3,1] input leaf tensor.
++    bool build_feats_graph_impl(ggml_context* ctx,
++                                const std::function<ggml_tensor*(ggml_context*)>& make_img,
++                                int H, int W, GraphInputPool& pool, ggml_tensor* out_feat[4]);
+     std::vector<float> interp_pos_embed(int gh, int gw) const;  // host bicubic -> [(1+gh*gw)*embed], token-major embed-minor
+     // Full multi-view forward on views already in processing order (ref first when
+     // selection is applied). Returns feats/cam_tokens in the SAME (input) order.
+diff --git a/src/engine.cpp b/src/engine.cpp
+index 010a6e0..70d39c1 100644
+--- a/src/engine.cpp
++++ b/src/engine.cpp
+@@ -170,6 +170,47 @@ bool Engine::depth_native_fused(const Image& img, std::vector<float>& depth_out,
+                      ms(t0,t1), ms(t1,t2));
+     return ok;
+ }
++bool Engine::depth_native_prepared(const std::function<void(ggml_tensor*)>& upload_img,
++                                   int H, int W, std::vector<float>& depth_out,
++                                   std::vector<float>& conf_out){
++    // Same fused graph as depth_native_fused, but the caller already produced the
++    // preprocessed [W,H,3,1] input (typically device-resident) and fills the input
++    // tensor via `upload_img` -- no host CHW buffer, no preprocess here.
++    if (!ml_.config().cat_token) { DA_LOG("depth_native_prepared: cat_token=false model, use depth_native"); return false; }
++    if (H <= 0 || W <= 0 || (H % (int)ml_.config().patch_size) || (W % (int)ml_.config().patch_size)) {
++        DA_LOG("depth_native_prepared: bad dims %dx%d (must be positive multiples of patch)", W, H);
++        return false;
++    }
++    const bool prof = std::getenv("DA_PROFILE") != nullptr;
++    auto now = []{ return std::chrono::high_resolution_clock::now(); };
++    auto ms = [](auto a, auto b){ return std::chrono::duration<double,std::milli>(b-a).count(); };
++    auto t1 = now();
++    DinoBackbone bb(ml_, be_);
++    DptHead head(ml_, be_);
++    ggml_tensor* out2b_w = ml_.tensor("head.scratch.out2b.weight");
++    const int output_dim = out2b_w ? (int)out2b_w->ne[3] : 2;
++    GraphInputPool pool;
++    std::vector<float> logits;
++    bool ok = be_.compute([&](ggml_context* ctx) -> ggml_tensor* {
++        ggml_tensor* feat[4] = { nullptr, nullptr, nullptr, nullptr };
++        if (!bb.build_feats_graph_pre(ctx, upload_img, H, W, pool, feat)) return nullptr;
++        return head.build_depth_graph(ctx, feat, H, W, pool, nullptr, nullptr, nullptr);
++    }, logits);
++    auto t2 = now();
++    if (!ok) { DA_LOG("depth_native_prepared: compute failed"); return false; }
++    const size_t HW = (size_t)H * W;
++    if (logits.size() != (size_t)output_dim * HW) { DA_LOG("depth_native_prepared: bad logits size"); return false; }
++    depth_out.resize(HW);
++    for (size_t i = 0; i < HW; ++i) depth_out[i] = std::exp(logits[i]);
++    if (output_dim >= 2) {
++        conf_out.resize(HW);
++        for (size_t i = 0; i < HW; ++i) conf_out[i] = std::exp(logits[HW + i]) + 1.0f;
++    } else {
++        conf_out.clear();
++    }
++    if (prof) DA_LOG("profile: [prepared] graph(backbone+head)=%.1fms", ms(t1,t2));
++    return true;
++}
+ bool Engine::depth_pose_native(const Image& img, std::vector<float>& depth, std::vector<float>& conf,
+                                std::array<float,12>& ext, std::array<float,9>& intr, int& H, int& W){
+     Preprocessed p;
+diff --git a/src/engine.hpp b/src/engine.hpp
+index 8181447..5e2bcd6 100644
+--- a/src/engine.hpp
++++ b/src/engine.hpp
+@@ -106,6 +106,16 @@ public:
+     // [H*W] row-major.
+     bool depth_metric(const Image& img, NestedOut& out, int& H, int& W);
+     bool depth_metric_path(const std::string& image_path, NestedOut& out, int& H, int& W);
++    // Device-resident-input production path: preprocessing (decode/resize/
++    // normalize to the DA3 processed dims H,W) was already done by the caller,
++    // e.g. on the GPU. `upload_img` is invoked with the allocated [W,H,3,1] F32
++    // input tensor and must fill it (device-to-device copy into tensor->data,
++    // or ggml_backend_tensor_set from host as a fallback). Fused depth(+conf)
++    // graph, no pose. cat_token=true (DA3 BASE/GIANT) only; returns false
++    // otherwise -- callers should fall back to depth_native_image().
++    bool depth_native_prepared(const std::function<void(ggml_tensor*)>& upload_img,
++                               int H, int W, std::vector<float>& depth_out,
++                               std::vector<float>& conf_out);
+ private:
+     // Fused single-image depth: backbone feats + DPT head built into ONE ggml graph
+     // (feats stay device-resident — no GPU->host->GPU round-trip). Parity-exact with
+-- 
+2.34.1
+

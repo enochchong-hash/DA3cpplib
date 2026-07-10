@@ -1,0 +1,553 @@
+From 60286905edfab77857edbc6b39c447dd928c4a4d Mon Sep 17 00:00:00 2001
+From: Enoch Chong <enoch.chong@devolrobots.com>
+Date: Fri, 3 Jul 2026 10:23:49 +0800
+Subject: [PATCH 2/3] custom dpt head
+
+---
+ CMakeLists.txt            |  12 ++
+ src/cuda_head_kernels.cu  | 392 ++++++++++++++++++++++++++++++++++++++
+ src/cuda_head_kernels.hpp |  38 ++++
+ src/dpt_blocks.cpp        |  34 ++++
+ 4 files changed, 476 insertions(+)
+ create mode 100644 src/cuda_head_kernels.cu
+ create mode 100644 src/cuda_head_kernels.hpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 732bfd5..f6cbd61 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -72,11 +72,23 @@ set(DA_SOURCES
+     src/cli.cpp
+     src/quantize.cpp
+ )
++if(DA_GGML_CUDA)
++    # Hand-written fused DPT-head kernels (see src/cuda_head_kernels.hpp).
++    # Runs via the GGML_OP_CUSTOM launch-descriptor extension patched into
++    # third_party/ggml's CUDA backend. Opt-in at runtime: DA_CONV=cuda_fused.
++    enable_language(CUDA)
++    list(APPEND DA_SOURCES src/cuda_head_kernels.cu)
++endif()
+ if(DA_SHARED)
+     add_library(depthanything SHARED ${DA_SOURCES})
+ else()
+     add_library(depthanything STATIC ${DA_SOURCES})
+ endif()
++if(DA_GGML_CUDA)
++    target_compile_definitions(depthanything PRIVATE DA_CUDA_HEAD)
++    find_package(CUDAToolkit REQUIRED)
++    target_link_libraries(depthanything PUBLIC CUDA::cudart)
++endif()
+ target_include_directories(depthanything
+     PUBLIC  ${DA_ROOT}/include
+     PRIVATE ${DA_ROOT}/src ${DA_ROOT}/third_party ${DA_ROOT}/third_party/stb)
+diff --git a/src/cuda_head_kernels.cu b/src/cuda_head_kernels.cu
+new file mode 100644
+index 0000000..4b7dd9f
+--- /dev/null
++++ b/src/cuda_head_kernels.cu
+@@ -0,0 +1,392 @@
++// See cuda_head_kernels.hpp. Implicit-GEMM 3x3 conv with fused pre-ReLU /
++// bias / residual epilogue, tiled BM=64 x BN=64 x BK=8, 256 threads computing
++// 4x4 micro-tiles -- the classic SGEMM shape with the B-matrix load replaced
++// by a virtual-im2col gather (so the 9x im2col tensor never exists).
++#include "cuda_head_kernels.hpp"
++
++#include <cuda_runtime.h>
++
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <map>
++#include <tuple>
++
++namespace {
++
++// Must match `ggml_cuda_custom_launch` in the patched ggml-cuda.cu exactly.
++struct CudaLaunchDesc {
++    uint64_t magic;  // 0x3344414355444121ULL
++    void (*launch)(ggml_tensor* dst, uintptr_t cuda_stream, void* user);
++    void* user;      // flags: bit0 prerelu, bit1 has_bias, bit2 has_residual
++};
++constexpr uint64_t kMagic = 0x3344414355444121ULL;
++
++constexpr int BM = 64, BN = 64, BK = 8, TT = 256;  // 16x16 threads, 4x4 tiles
++
++// BM_/TM_ templated so small-OC convs (e.g. out2a, OC=32) use a BM=32 tile
++// instead of running half-empty.
++template <int BM_, int TM_>
++__global__ void k_conv3x3_igemm(const float* __restrict__ X, const float* __restrict__ Wt,
++                                const float* __restrict__ B, const float* __restrict__ R,
++                                float* __restrict__ Y,
++                                int W, int H, int IC, int OC, int flags) {
++    const int P = W * H;
++    const int K = IC * 9;
++    __shared__ float As[BK][BM_];
++    __shared__ float Bs[BK][BN];
++    const int m0 = blockIdx.y * BM_;  // output-channel block
++    const int n0 = blockIdx.x * BN;   // pixel block
++    const int tid = threadIdx.x;
++    const int tm = tid / 16, tn = tid % 16;
++    float acc[TM_][4] = {};
++
++    for (int k0 = 0; k0 < K; k0 += BK) {
++        // Stage A tile: weights are a ready-made row-major [OC][IC*9] matrix.
++        for (int i = tid; i < BM_ * BK; i += TT) {
++            const int mm = i / BK, kk = i % BK;
++            const int m = m0 + mm, k = k0 + kk;
++            As[kk][mm] = (m < OC && k < K) ? Wt[(size_t)m * K + k] : 0.f;
++        }
++        // Stage B tile: virtual im2col gather (zero pad, optional pre-ReLU).
++        for (int i = tid; i < BN * BK; i += TT) {
++            const int nn = i / BK, kk = i % BK;
++            const int k = k0 + kk, p = n0 + nn;
++            float v = 0.f;
++            if (k < K && p < P) {
++                const int ic = k / 9, t = k % 9;
++                const int iy = p / W + t / 3 - 1;
++                const int ix = p % W + t % 3 - 1;
++                if (iy >= 0 && iy < H && ix >= 0 && ix < W) {
++                    v = X[(size_t)ic * P + (size_t)iy * W + ix];
++                    if (flags & 1) v = fmaxf(v, 0.f);
++                }
++            }
++            Bs[kk][nn] = v;
++        }
++        __syncthreads();
++        #pragma unroll
++        for (int kk = 0; kk < BK; ++kk) {
++            float a[TM_], b[4];
++            #pragma unroll
++            for (int u = 0; u < TM_; ++u) a[u] = As[kk][tm * TM_ + u];
++            #pragma unroll
++            for (int v = 0; v < 4; ++v) b[v] = Bs[kk][tn * 4 + v];
++            #pragma unroll
++            for (int u = 0; u < TM_; ++u)
++                #pragma unroll
++                for (int v = 0; v < 4; ++v) acc[u][v] += a[u] * b[v];
++        }
++        __syncthreads();
++    }
++
++    #pragma unroll
++    for (int u = 0; u < TM_; ++u) {
++        const int m = m0 + tm * TM_ + u;
++        if (m >= OC) continue;
++        #pragma unroll
++        for (int v = 0; v < 4; ++v) {
++            const int p = n0 + tn * 4 + v;
++            if (p >= P) continue;
++            float c = acc[u][v];
++            if (flags & 2) c += B[m];
++            if (flags & 4) c += R[(size_t)m * P + p];
++            Y[(size_t)m * P + p] = c;
++        }
++    }
++}
++
++// Transposed conv with stride == kernel size (the DPT reassemble resizes:
++// 4x4 s4 and 2x2 s2). Each output pixel then receives EXACTLY one input tap:
++// out[oc, iy*s+ky, ix*s+kx] = sum_ic W[kx,ky,oc,ic] * X[ic, iy, ix]  (+bias)
++// i.e. a plain GEMM C[M=OC*s*s][N=P_in] = A[M][IC] * B[IC][P_in] with a
++// pixel-shuffle epilogue -- no stride/mod divergence, unlike ggml's naive
++// conv2d-transpose kernel (one thread per output looping all IC*K*K taps).
++// Weight layout [KW,KH,OC,IC]: A[m][ic] = Wdata[ic*(KW*KH*OC) + m] with
++// m = (oc*KH + ky)*KW + kx (kx fastest -- matches m enumeration exactly).
++__global__ void k_convT_igemm(const float* __restrict__ X, const float* __restrict__ Wt,
++                              const float* __restrict__ B,
++                              float* __restrict__ Y,
++                              int Win, int Hin, int IC, int OC, int S, int flags) {
++    const int Pin = Win * Hin;
++    const int M = OC * S * S;
++    const int Wout = Win * S;
++    const size_t Pout = (size_t)Wout * (Hin * S);
++    __shared__ float As[BK][BM];
++    __shared__ float Bs[BK][BN];
++    const int m0 = blockIdx.y * BM;
++    const int n0 = blockIdx.x * BN;
++    const int tid = threadIdx.x;
++    const int tm = tid / 16, tn = tid % 16;
++    float acc[4][4] = {};
++
++    for (int k0 = 0; k0 < IC; k0 += BK) {
++        for (int i = tid; i < BM * BK; i += TT) {
++            const int mm = i / BK, kk = i % BK;
++            const int m = m0 + mm, k = k0 + kk;
++            As[kk][mm] = (m < M && k < IC) ? Wt[(size_t)k * M + m] : 0.f;
++        }
++        for (int i = tid; i < BN * BK; i += TT) {
++            const int nn = i / BK, kk = i % BK;
++            const int k = k0 + kk, p = n0 + nn;
++            Bs[kk][nn] = (k < IC && p < Pin) ? X[(size_t)k * Pin + p] : 0.f;
++        }
++        __syncthreads();
++        #pragma unroll
++        for (int kk = 0; kk < BK; ++kk) {
++            float a[4], b[4];
++            #pragma unroll
++            for (int u = 0; u < 4; ++u) a[u] = As[kk][tm * 4 + u];
++            #pragma unroll
++            for (int v = 0; v < 4; ++v) b[v] = Bs[kk][tn * 4 + v];
++            #pragma unroll
++            for (int u = 0; u < 4; ++u)
++                #pragma unroll
++                for (int v = 0; v < 4; ++v) acc[u][v] += a[u] * b[v];
++        }
++        __syncthreads();
++    }
++
++    #pragma unroll
++    for (int u = 0; u < 4; ++u) {
++        const int m = m0 + tm * 4 + u;
++        if (m >= M) continue;
++        const int kx = m % S, ky = (m / S) % S, oc = m / (S * S);
++        #pragma unroll
++        for (int v = 0; v < 4; ++v) {
++            const int p = n0 + tn * 4 + v;
++            if (p >= Pin) continue;
++            const int ix = p % Win, iy = p / Win;
++            float c = acc[u][v];
++            if (flags & 2) c += B[oc];
++            Y[(size_t)oc * Pout + (size_t)(iy * S + ky) * Wout + (ix * S + kx)] = c;
++        }
++    }
++}
++
++// DA_CUDA_HEAD_STATS=1: per-shape kernel timing via CUDA events (synchronous;
++// diagnostics only), dumped at process exit.
++struct ShapeStat { int count = 0; double ms = 0.0; };
++std::map<std::tuple<int,int,int,int,int>, ShapeStat> g_stats;
++bool stats_enabled() {
++    static const bool on = std::getenv("DA_CUDA_HEAD_STATS") != nullptr;
++    return on;
++}
++void dump_stats() {
++    double tot = 0.0;
++    for (const auto& [k, v] : g_stats) {
++        const auto& [W, H, IC, OC, flags] = k;
++        fprintf(stderr, "[cuda_head] %4dx%-4d IC=%-4d OC=%-4d flags=%d  n=%-3d total=%7.2fms  avg=%.3fms\n",
++                W, H, IC, OC, flags, v.count, v.ms, v.ms / v.count);
++        tot += v.ms;
++    }
++    fprintf(stderr, "[cuda_head] TOTAL fused-conv kernel time: %.2fms\n", tot);
++}
++
++void cuda_launch(ggml_tensor* dst, uintptr_t stream, void* user) {
++    const int flags = (int)(uintptr_t)user;
++    const ggml_tensor* x = dst->src[0];
++    const ggml_tensor* w = dst->src[1];
++    int si = 2;
++    const ggml_tensor* b = (flags & 2) ? dst->src[si++] : nullptr;
++    const ggml_tensor* r = (flags & 4) ? dst->src[si++] : nullptr;
++    const int W = (int)x->ne[0], H = (int)x->ne[1];
++    const int IC = (int)w->ne[2], OC = (int)w->ne[3];
++    const int P = W * H;
++    const bool small_oc = OC <= 32;
++    const dim3 grid((P + BN - 1) / BN, (OC + (small_oc ? 32 : BM) - 1) / (small_oc ? 32 : BM));
++
++    cudaEvent_t e0 = nullptr, e1 = nullptr;
++    if (stats_enabled()) {
++        cudaEventCreate(&e0); cudaEventCreate(&e1);
++        cudaEventRecord(e0, (cudaStream_t)stream);
++    }
++    if (small_oc) {
++        k_conv3x3_igemm<32, 2><<<grid, TT, 0, (cudaStream_t)stream>>>(
++            (const float*)x->data, (const float*)w->data,
++            b ? (const float*)b->data : nullptr, r ? (const float*)r->data : nullptr,
++            (float*)dst->data, W, H, IC, OC, flags);
++    } else {
++        k_conv3x3_igemm<BM, 4><<<grid, TT, 0, (cudaStream_t)stream>>>(
++            (const float*)x->data, (const float*)w->data,
++            b ? (const float*)b->data : nullptr, r ? (const float*)r->data : nullptr,
++            (float*)dst->data, W, H, IC, OC, flags);
++    }
++    if (stats_enabled()) {
++        cudaEventRecord(e1, (cudaStream_t)stream);
++        cudaEventSynchronize(e1);
++        float ms = 0.f;
++        cudaEventElapsedTime(&ms, e0, e1);
++        cudaEventDestroy(e0); cudaEventDestroy(e1);
++        static const bool reg = [] { atexit(dump_stats); return true; }();
++        (void)reg;
++        auto& st = g_stats[{W, H, IC, OC, flags}];
++        st.count += 1; st.ms += ms;
++    }
++}
++
++// Launch for the transposed conv. flags bit1 = bias; bit3 marks convT (stats
++// disambiguation only). Stride recovered from the weight tensor (KW == S).
++void cuda_launch_convT(ggml_tensor* dst, uintptr_t stream, void* user) {
++    const int flags = (int)(uintptr_t)user;
++    const ggml_tensor* x = dst->src[0];
++    const ggml_tensor* w = dst->src[1];
++    const ggml_tensor* b = (flags & 2) ? dst->src[2] : nullptr;
++    const int Win = (int)x->ne[0], Hin = (int)x->ne[1];
++    const int S = (int)w->ne[0];
++    const int OC = (int)w->ne[2], IC = (int)w->ne[3];
++    const int Pin = Win * Hin, M = OC * S * S;
++    const dim3 grid((Pin + BN - 1) / BN, (M + BM - 1) / BM);
++
++    cudaEvent_t e0 = nullptr, e1 = nullptr;
++    if (stats_enabled()) { cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventRecord(e0, (cudaStream_t)stream); }
++    k_convT_igemm<<<grid, TT, 0, (cudaStream_t)stream>>>(
++        (const float*)x->data, (const float*)w->data,
++        b ? (const float*)b->data : nullptr,
++        (float*)dst->data, Win, Hin, IC, OC, S, flags);
++    if (stats_enabled()) {
++        cudaEventRecord(e1, (cudaStream_t)stream);
++        cudaEventSynchronize(e1);
++        float ms = 0.f; cudaEventElapsedTime(&ms, e0, e1);
++        cudaEventDestroy(e0); cudaEventDestroy(e1);
++        static const bool reg = [] { atexit(dump_stats); return true; }();
++        (void)reg;
++        auto& st = g_stats[{Win, Hin, IC, OC, flags}];
++        st.count += 1; st.ms += ms;
++    }
++}
++
++// CPU fallback (only runs if the scheduler ever places the node on the CPU
++// backend, which supports_op should prevent). Correct but naive.
++void cpu_fallback(ggml_tensor* dst, int ith, int nth, void* userdata) {
++    const auto* desc = (const CudaLaunchDesc*)userdata;
++    const int flags = (int)(uintptr_t)desc->user;
++    const ggml_tensor* x = dst->src[0];
++    const ggml_tensor* w = dst->src[1];
++    int si = 2;
++    const ggml_tensor* b = (flags & 2) ? dst->src[si++] : nullptr;
++    const ggml_tensor* r = (flags & 4) ? dst->src[si++] : nullptr;
++    const int W = (int)x->ne[0], H = (int)x->ne[1];
++    const int IC = (int)w->ne[2], OC = (int)w->ne[3];
++    const float* X = (const float*)x->data;
++    const float* Wt = (const float*)w->data;
++    float* Y = (float*)dst->data;
++    const size_t P = (size_t)W * H;
++    for (int oc = ith; oc < OC; oc += nth) {
++        for (int py = 0; py < H; ++py) for (int px = 0; px < W; ++px) {
++            float acc = 0.f;
++            for (int ic = 0; ic < IC; ++ic)
++                for (int t = 0; t < 9; ++t) {
++                    const int iy = py + t / 3 - 1, ix = px + t % 3 - 1;
++                    if (iy < 0 || iy >= H || ix < 0 || ix >= W) continue;
++                    float v = X[ic * P + (size_t)iy * W + ix];
++                    if (flags & 1) v = fmaxf(v, 0.f);
++                    acc += Wt[(((size_t)oc * IC + ic) * 3 + t / 3) * 3 + t % 3] * v;
++                }
++            if (b) acc += ((const float*)b->data)[oc];
++            if (r) acc += ((const float*)r->data)[oc * P + (size_t)py * W + px];
++            Y[oc * P + (size_t)py * W + px] = acc;
++        }
++    }
++}
++
++// Naive CPU fallback for the transposed conv (same caveat as cpu_fallback).
++void cpu_fallback_convT(ggml_tensor* dst, int ith, int nth, void* userdata) {
++    const auto* desc = (const CudaLaunchDesc*)userdata;
++    const int flags = (int)(uintptr_t)desc->user;
++    const ggml_tensor* x = dst->src[0];
++    const ggml_tensor* w = dst->src[1];
++    const ggml_tensor* b = (flags & 2) ? dst->src[2] : nullptr;
++    const int Win = (int)x->ne[0], Hin = (int)x->ne[1];
++    const int S = (int)w->ne[0];
++    const int OC = (int)w->ne[2], IC = (int)w->ne[3];
++    const size_t Pin = (size_t)Win * Hin, Pout = Pin * S * S;
++    const int Wout = Win * S;
++    const float* X = (const float*)x->data;
++    const float* Wt = (const float*)w->data;
++    float* Y = (float*)dst->data;
++    for (int oc = ith; oc < OC; oc += nth)
++        for (int iy = 0; iy < Hin; ++iy) for (int ix = 0; ix < Win; ++ix)
++            for (int ky = 0; ky < S; ++ky) for (int kx = 0; kx < S; ++kx) {
++                float acc = b ? ((const float*)b->data)[oc] : 0.f;
++                for (int ic = 0; ic < IC; ++ic)
++                    acc += Wt[(size_t)kx + S*ky + (size_t)S*S*oc + (size_t)S*S*OC*ic] *
++                           X[(size_t)ic * Pin + (size_t)iy * Win + ix];
++                Y[(size_t)oc * Pout + (size_t)(iy*S+ky) * Wout + (ix*S+kx)] = acc;
++            }
++}
++
++// One static descriptor per flag combination; userdata must stay valid for the
++// node's lifetime, and these cover every (prerelu, bias, residual) case.
++// [8..15]: transposed-conv variants (bit3 set; only bias varies in practice).
++CudaLaunchDesc g_desc[16] = {
++    {kMagic, cuda_launch, (void*)(uintptr_t)0}, {kMagic, cuda_launch, (void*)(uintptr_t)1},
++    {kMagic, cuda_launch, (void*)(uintptr_t)2}, {kMagic, cuda_launch, (void*)(uintptr_t)3},
++    {kMagic, cuda_launch, (void*)(uintptr_t)4}, {kMagic, cuda_launch, (void*)(uintptr_t)5},
++    {kMagic, cuda_launch, (void*)(uintptr_t)6}, {kMagic, cuda_launch, (void*)(uintptr_t)7},
++    {kMagic, cuda_launch_convT, (void*)(uintptr_t)8},  {kMagic, cuda_launch_convT, (void*)(uintptr_t)9},
++    {kMagic, cuda_launch_convT, (void*)(uintptr_t)10}, {kMagic, cuda_launch_convT, (void*)(uintptr_t)11},
++    {kMagic, cuda_launch_convT, (void*)(uintptr_t)12}, {kMagic, cuda_launch_convT, (void*)(uintptr_t)13},
++    {kMagic, cuda_launch_convT, (void*)(uintptr_t)14}, {kMagic, cuda_launch_convT, (void*)(uintptr_t)15},
++};
++
++}  // namespace
++
++namespace da {
++
++bool cuda_head_enabled() {
++    static const bool on = [] {
++        const char* m = std::getenv("DA_CONV");
++        return m && std::strcmp(m, "cuda_fused") == 0;
++    }();
++    return on;
++}
++
++ggml_tensor* cuda_fused_conv3x3(ggml_context* ctx, ggml_tensor* w, ggml_tensor* b,
++                                ggml_tensor* x, ggml_tensor* residual, bool prerelu) {
++    if (!w || !x) return nullptr;
++    if (w->ne[0] != 3 || w->ne[1] != 3) return nullptr;
++    if (w->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32) return nullptr;
++    if (x->ne[3] != 1 || x->ne[2] != w->ne[2]) return nullptr;
++    if (!ggml_is_contiguous(w)) return nullptr;
++    if (b && (b->type != GGML_TYPE_F32 || !ggml_is_contiguous(b) || b->ne[0] != w->ne[3])) return nullptr;
++    if (residual && (residual->type != GGML_TYPE_F32 || !ggml_is_contiguous(residual) ||
++                     residual->ne[0] != x->ne[0] || residual->ne[1] != x->ne[1] ||
++                     residual->ne[2] != w->ne[3])) return nullptr;
++    if (!ggml_is_contiguous(x)) x = ggml_cont(ctx, x);
++
++    int flags = (prerelu ? 1 : 0) | (b ? 2 : 0) | (residual ? 4 : 0);
++    ggml_tensor* args[4];
++    int n = 0;
++    args[n++] = x;
++    args[n++] = w;
++    if (b) args[n++] = b;
++    if (residual) args[n++] = residual;
++    return ggml_custom_4d(ctx, GGML_TYPE_F32, x->ne[0], x->ne[1], w->ne[3], 1,
++                          args, n, cpu_fallback, GGML_N_TASKS_MAX, &g_desc[flags]);
++}
++
++ggml_tensor* cuda_fused_convT(ggml_context* ctx, ggml_tensor* w, ggml_tensor* b,
++                              ggml_tensor* x, int stride) {
++    if (!w || !x) return nullptr;
++    // Only the stride==kernel (pixel-shuffle GEMM) case; weight [KW,KH,OC,IC].
++    if ((int)w->ne[0] != stride || (int)w->ne[1] != stride) return nullptr;
++    if (w->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32) return nullptr;
++    if (x->ne[3] != 1 || x->ne[2] != w->ne[3]) return nullptr;
++    if (!ggml_is_contiguous(w)) return nullptr;
++    if (b && (b->type != GGML_TYPE_F32 || !ggml_is_contiguous(b) || b->ne[0] != w->ne[2])) return nullptr;
++    if (!ggml_is_contiguous(x)) x = ggml_cont(ctx, x);
++
++    const int flags = 8 | (b ? 2 : 0);
++    ggml_tensor* args[3];
++    int n = 0;
++    args[n++] = x;
++    args[n++] = w;
++    if (b) args[n++] = b;
++    return ggml_custom_4d(ctx, GGML_TYPE_F32, x->ne[0] * stride, x->ne[1] * stride,
++                          w->ne[2], 1, args, n, cpu_fallback_convT, GGML_N_TASKS_MAX,
++                          &g_desc[flags]);
++}
++
++}  // namespace da
+diff --git a/src/cuda_head_kernels.hpp b/src/cuda_head_kernels.hpp
+new file mode 100644
+index 0000000..7f7933f
+--- /dev/null
++++ b/src/cuda_head_kernels.hpp
+@@ -0,0 +1,38 @@
++// Hand-written fused CUDA kernels for the DPT head's 3x3 convolutions.
++//
++// The head's 3x3 stride-1 pad-1 F32 convs go through ggml_conv_2d (im2col +
++// GEMM) by default, which materializes a 9x-expanded im2col tensor in global
++// memory per conv. The fused implicit-GEMM kernel here gathers the im2col
++// virtually inside the matmul tiles and additionally fuses the RCU's leading
++// ReLU, the bias add, and the residual add -- removing several full-feature-map
++// round-trips per FeatureFusionBlock.
++//
++// Execution: the node is a GGML_OP_CUSTOM whose userdata carries a CUDA launch
++// descriptor; the locally patched third_party/ggml ggml-cuda backend detects
++// the descriptor (magic), keeps the node on the GPU and calls launch() with
++// the backend stream (see "depth-anything.cpp local extension" in ggml-cuda.cu).
++//
++// Opt-in via DA_CONV=cuda_fused. Only compiled when DA_GGML_CUDA=ON
++// (DA_CUDA_HEAD is then defined); dpt_blocks.cpp guards all call sites.
++#pragma once
++#include "ggml.h"
++namespace da {
++
++// True iff DA_CONV=cuda_fused (checked once).
++bool cuda_head_enabled();
++
++// Build the fused conv node: y = conv3x3_pad1_stride1(prerelu ? relu(x) : x)
++// [+ bias] [+ residual]. All tensors F32; w:[3,3,IC,OC], x:[W,H,IC,1],
++// residual (optional) must be [W,H,OC,1] contiguous. Returns nullptr when the
++// shapes/types don't qualify -- caller falls back to the ggml path.
++ggml_tensor* cuda_fused_conv3x3(ggml_context* ctx, ggml_tensor* w, ggml_tensor* b,
++                                ggml_tensor* x, ggml_tensor* residual, bool prerelu);
++
++// Transposed conv with stride == kernel size (DPT reassemble resize layers):
++// reduces to a pixel-shuffle GEMM, replacing ggml's naive conv2d-transpose
++// kernel. w:[S,S,OC,IC], x:[W,H,IC,1] -> [W*S,H*S,OC,1]. nullptr if shapes
++// don't qualify.
++ggml_tensor* cuda_fused_convT(ggml_context* ctx, ggml_tensor* w, ggml_tensor* b,
++                              ggml_tensor* x, int stride);
++
++}  // namespace da
+diff --git a/src/dpt_blocks.cpp b/src/dpt_blocks.cpp
+index 21ce0b3..5c0a0a2 100644
+--- a/src/dpt_blocks.cpp
++++ b/src/dpt_blocks.cpp
+@@ -1,6 +1,9 @@
+ #include "dpt_blocks.hpp"
+ #include "winograd.hpp"
+ #include "compute_mode.hpp"
++#ifdef DA_CUDA_HEAD
++#include "cuda_head_kernels.hpp"
++#endif
+ #include <cstdlib>
+ #include <cstring>
+ 
+@@ -20,6 +23,15 @@ ggml_tensor* conv2d(ggml_context* ctx, ggml_tensor* w, ggml_tensor* b, ggml_tens
+     // (llamafile sgemm). A/B toggle via DA_CONV: "direct"|"im2col"|"auto" (default auto).
+     const char* mode = std::getenv("DA_CONV");
+     const bool kgt1 = (w->ne[0] > 1 || w->ne[1] > 1);
++#ifdef DA_CUDA_HEAD
++    // Fused implicit-GEMM CUDA kernel (DA_CONV=cuda_fused, GPU, 3x3 s1 p1 F32):
++    // no im2col intermediate, bias fused into the epilogue. Falls through to
++    // the regular paths when the shape doesn't qualify.
++    if (cuda_head_enabled() && da::gpu_mode() && stride == 1 && pad == 1) {
++        ggml_tensor* y = cuda_fused_conv3x3(ctx, w, b, x, nullptr, false);
++        if (y) return y;
++    }
++#endif
+     // Winograd is valid for 3x3 stride-1 F32 convs and is the AUTO default for
+     // them: it beats ggml's direct conv on the warm DPT head, parity-exact
+     // (max|d|~1.4e-5). The default kernel is the BLOCKED F(2x2) GEMM (DA_WINO=f2b,
+@@ -55,6 +67,15 @@ ggml_tensor* conv_transpose2d_p0(ggml_context* ctx, ggml_tensor* w, ggml_tensor*
+     // ggml_conv_transpose_2d_p0 expects kernel layout (KW,KH,Cout,Cin) == [KW,KH,OC,IC],
+     // which is exactly the straight dim-reversal of torch ConvTranspose2d (IC,OC,KH,KW).
+     // x:[W,H,IC,N] -> [W_out,H_out,OC,N]
++#ifdef DA_CUDA_HEAD
++    // Pixel-shuffle GEMM kernel for the stride==kernel case (DA_CONV=cuda_fused):
++    // ggml's conv2d-transpose CUDA kernel loops all IC*K*K taps per output with
++    // divergent stride checks; here each output has exactly one tap.
++    if (cuda_head_enabled() && da::gpu_mode()) {
++        ggml_tensor* y = cuda_fused_convT(ctx, w, b, x, stride);
++        if (y) return y;
++    }
++#endif
+     ggml_tensor* y = ggml_conv_transpose_2d_p0(ctx, w, x, stride);
+     if (b) y = ggml_add(ctx, y, bias_chw(ctx, b));
+     return y;
+@@ -68,6 +89,19 @@ ggml_tensor* interp_bilinear_ac(ggml_context* ctx, ggml_tensor* x, int out_w, in
+ ggml_tensor* residual_conv_unit(ggml_context* ctx, ggml_tensor* x,
+                                 ggml_tensor* c1w, ggml_tensor* c1b,
+                                 ggml_tensor* c2w, ggml_tensor* c2b) {
++#ifdef DA_CUDA_HEAD
++    // Fully fused RCU (DA_CONV=cuda_fused): the leading ReLUs fold into the
++    // convs' input gather and the trailing +x into conv2's epilogue -- two
++    // kernel launches instead of five ops with materialized intermediates.
++    if (cuda_head_enabled() && da::gpu_mode()) {
++        ggml_tensor* xc = ggml_is_contiguous(x) ? x : ggml_cont(ctx, x);
++        ggml_tensor* o1 = cuda_fused_conv3x3(ctx, c1w, c1b, xc, nullptr, /*prerelu=*/true);
++        if (o1) {
++            ggml_tensor* o2 = cuda_fused_conv3x3(ctx, c2w, c2b, o1, xc, /*prerelu=*/true);
++            if (o2) return o2;
++        }
++    }
++#endif
+     // out = relu(x); out = conv1(out); out = relu(out); out = conv2(out); return out + x
+     ggml_tensor* out = ggml_relu(ctx, x);
+     out = conv2d(ctx, c1w, c1b, out, 1, 1);     // 3x3 pad1 stride1
+-- 
+2.34.1
+
