@@ -12,6 +12,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REL_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Public upstream base for the engine.  Local engine work is intentionally
+# shipped as scripts/patches/depth-anything.cpp/*.patch instead of being used
+# as the submodule gitlink, so a fresh checkout never needs unpublished SHAs.
+export DA3_DEPTH_ANYTHING_UPSTREAM="f4e17dea695dd12ae76bea98ba58030996b98118"
+
 cd "$REL_ROOT"
 
 echo "=== DA3 Setup ==="
@@ -89,6 +94,7 @@ echo ""
 
 # Apply patches
 echo "Applying patches..."
+echo "  depth-anything.cpp base: $DA3_DEPTH_ANYTHING_UPSTREAM"
 "$SCRIPT_DIR/apply_patches.sh"
 echo ""
 

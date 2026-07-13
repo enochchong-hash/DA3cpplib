@@ -16,6 +16,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REL_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PATCH_DIR="$REL_ROOT/scripts/patches"
+ENGINE_UPSTREAM="${DA3_DEPTH_ANYTHING_UPSTREAM:-f4e17dea695dd12ae76bea98ba58030996b98118}"
+GGML_UPSTREAM="3af5f5760e19a96427f5f7a93b79cbdf3d4b265b"
 
 cd "$REL_ROOT"
 
@@ -88,8 +90,8 @@ echo ""
 GGML_DIR="$REL_ROOT/3rdparty/depth-anything.cpp/third_party/ggml"
 ENGINE_DIR="$REL_ROOT/3rdparty/depth-anything.cpp"
 
-apply_patch_set "ggml"   "$GGML_DIR"   3af5f57 "$PATCH_DIR/ggml"
-apply_patch_set "engine" "$ENGINE_DIR" f4e17de "$PATCH_DIR/depth-anything.cpp"
+apply_patch_set "ggml"   "$GGML_DIR"   "$GGML_UPSTREAM" "$PATCH_DIR/ggml"
+apply_patch_set "engine" "$ENGINE_DIR" "$ENGINE_UPSTREAM" "$PATCH_DIR/depth-anything.cpp"
 
 echo ""
 echo "=== Patch application complete ==="
