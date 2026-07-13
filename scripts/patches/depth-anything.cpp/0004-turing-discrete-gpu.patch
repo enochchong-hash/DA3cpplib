@@ -1,0 +1,221 @@
+From 8dbdf4c8a39145f0b06a38dfd649d11b0b94cf15 Mon Sep 17 00:00:00 2001
+From: da3-release <da3-release@local>
+Date: Mon, 13 Jul 2026 16:00:00 +0800
+Subject: [PATCH 4/4] support fused CUDA head on Turing discrete GPUs
+
+---
+ src/cuda_head_kernels.cu | 22 +++++++++++++++++++++-
+ src/dino_backbone.cpp    | 16 ++++++++--------
+ src/model_loader.cpp     | 24 ++++++++++++++++--------
+ src/model_loader.hpp     |  4 ++++
+ 4 files changed, 49 insertions(+), 17 deletions(-)
+
+diff --git a/src/cuda_head_kernels.cu b/src/cuda_head_kernels.cu
+index 299a1d4..e134584 100644
+--- a/src/cuda_head_kernels.cu
++++ b/src/cuda_head_kernels.cu
+@@ -196,6 +196,7 @@ __global__ void k_conv3x3_wmma(const float* __restrict__ X, const float* __restr
+                                const float* __restrict__ B, const float* __restrict__ R,
+                                float* __restrict__ Y,
+                                int W, int H, int IC, int OC, int flags) {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+     using namespace nvcuda;
+     const int P = W * H;
+     const int K = IC * 9;
+@@ -262,6 +263,25 @@ __global__ void k_conv3x3_wmma(const float* __restrict__ X, const float* __restr
+         if (flags & 4) c += R[(size_t)m * P + p];
+         Y[(size_t)m * P + p] = c;
+     }
++#endif
++}
++
++// TF32 WMMA is only available on Ampere (compute capability 8.0) and newer.
++// Keep the kernel in all builds so a single source can target older GPUs, but
++// never launch its empty pre-Ampere specialization.
++bool cuda_tf32_supported() {
++    static thread_local int cached_device = -1;
++    static thread_local bool cached_supported = false;
++    int device = -1;
++    if (cudaGetDevice(&device) != cudaSuccess) return false;
++    if (device != cached_device) {
++        int major = 0;
++        cached_supported =
++            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) == cudaSuccess &&
++            major >= 8;
++        cached_device = device;
++    }
++    return cached_supported;
+ }
+ 
+ // Fused align-corners-bilinear-upsample -> conv (K2 in the plan): the conv's
+@@ -476,7 +496,7 @@ void cuda_launch(ggml_tensor* dst, uintptr_t stream, void* user) {
+     } else if (small_oc) {
+         k_conv3x3_igemm<32, 2, BN, 4><<<grid, TT, 0, (cudaStream_t)stream>>>(
+             Xp, Wp, Bp, Rp, Yp, W, H, IC, OC, flags);
+-    } else if (tf32) {
++    } else if (tf32 && cuda_tf32_supported()) {
+         k_conv3x3_wmma<<<grid, TT, 0, (cudaStream_t)stream>>>(
+             Xp, Wp, Bp, Rp, Yp, W, H, IC, OC, flags);
+     } else {
+diff --git a/src/dino_backbone.cpp b/src/dino_backbone.cpp
+index be8fdbf..50283b7 100644
+--- a/src/dino_backbone.cpp
++++ b/src/dino_backbone.cpp
+@@ -17,7 +17,7 @@ static float cubic(float x){ // Catmull-Rom, a=-0.75 (PyTorch bicubic)
+ }
+ std::vector<float> DinoBackbone::interp_pos_embed(int gh, int gw) const {
+     const auto& c = ml_.config();
+-    ggml_tensor* pe = ml_.tensor("vit.pos_embed");   // ggml ne0=embed (768), ne1=rows (1370)
++    ggml_tensor* pe = ml_.host_tensor("vit.pos_embed"); // ggml ne0=embed (768), ne1=rows (1370)
+     const int embed = (int)c.embed_dim, M = (int)c.pos_embed_grid;
+     const float* p = (const float*)pe->data;         // row r, channel ch at p[r*embed + ch]
+     // Input-INDEPENDENT (depends only on the model's pos_embed + grid gh,gw), so it
+@@ -99,7 +99,7 @@ bool DinoBackbone::forward(const std::vector<float>& input_chw, int H, int W,
+     std::vector<float> pos = interp_pos_embed(gh, gw);
+ 
+     // Camera token (N=1): reference slot only -> camera_token row 0 (ne1 index 0).
+-    ggml_tensor* camt = ml_.tensor("vit.camera_token");          // ggml ne0=embed, ne1=2
++    ggml_tensor* camt = ml_.host_tensor("vit.camera_token");     // ggml ne0=embed, ne1=2
+     std::vector<float> cam0(embed, 0.f);
+     if (camt){ const float* cp=(const float*)camt->data; for (int e=0;e<embed;++e) cam0[e]=cp[e]; }
+ 
+@@ -167,8 +167,8 @@ bool DinoBackbone::forward(const std::vector<float>& input_chw, int H, int W,
+     // --- host post-process matching get_intermediate_layers (width == 2*embed) ---
+     // feat   = cat([local_x, vit_norm(x)]) over channels, patches 1..256  -> [256,1536]
+     // cam    = cat([local_x[token0], x[token0]]) RAW (no norm)            -> [1536]
+-    ggml_tensor* nw = ml_.tensor("vit.norm.weight");
+-    ggml_tensor* nb = ml_.tensor("vit.norm.bias");
++    ggml_tensor* nw = ml_.host_tensor("vit.norm.weight");
++    ggml_tensor* nb = ml_.host_tensor("vit.norm.bias");
+     const float* nwp=(const float*)nw->data;
+     const float* nbp=(const float*)nb->data;
+     auto layernorm_host=[&](const float* row)->std::vector<float>{
+@@ -248,7 +248,7 @@ bool DinoBackbone::build_feats_graph_impl(ggml_context* ctx,
+ 
+     std::vector<float> pos = interp_pos_embed(gh, gw);
+ 
+-    ggml_tensor* camt = ml_.tensor("vit.camera_token");
++    ggml_tensor* camt = ml_.host_tensor("vit.camera_token");
+     std::vector<float> cam0(embed, 0.f);
+     if (camt){ const float* cp=(const float*)camt->data; for (int e=0;e<embed;++e) cam0[e]=cp[e]; }
+ 
+@@ -485,7 +485,7 @@ bool DinoBackbone::forward_mv_ordered(const std::vector<std::vector<float>>& vie
+     std::vector<float> pos = interp_pos_embed(gh, gw);
+ 
+     // Camera token slots: ref = slot 0, src = slot 1 (camera_token ne0=embed, ne1=2).
+-    ggml_tensor* camt = ml_.tensor("vit.camera_token");
++    ggml_tensor* camt = ml_.host_tensor("vit.camera_token");
+     std::vector<float> cam_ref(embed, 0.f), cam_src(embed, 0.f);
+     if (camt){ const float* cp=(const float*)camt->data;
+         for (int e=0;e<embed;++e){ cam_ref[e]=cp[e]; cam_src[e]=cp[(size_t)embed+e]; } }
+@@ -581,8 +581,8 @@ bool DinoBackbone::forward_mv_ordered(const std::vector<std::vector<float>>& vie
+     if (!ok) return false;
+ 
+     // Host post-process per view (matches the S=1 path, repeated per view-slice).
+-    ggml_tensor* nw = ml_.tensor("vit.norm.weight");
+-    ggml_tensor* nb = ml_.tensor("vit.norm.bias");
++    ggml_tensor* nw = ml_.host_tensor("vit.norm.weight");
++    ggml_tensor* nb = ml_.host_tensor("vit.norm.bias");
+     const float* nwp=(const float*)nw->data;
+     const float* nbp=(const float*)nb->data;
+     auto layernorm_host=[&](const float* row)->std::vector<float>{
+diff --git a/src/model_loader.cpp b/src/model_loader.cpp
+index 686d557..bf1cdd6 100644
+--- a/src/model_loader.cpp
++++ b/src/model_loader.cpp
+@@ -15,16 +15,16 @@ static bool g_gpu_mode = false;
+ void set_gpu_mode(bool on){ g_gpu_mode = on; }
+ bool gpu_mode(){ return g_gpu_mode; }
+ 
+-// Weights read directly on the HOST via ->data during graph build (they feed
+-// host-computed graph INPUTS, not graph nodes), so they MUST stay in
+-// host-accessible memory and are never mirrored to the device:
++// Weights read directly on the HOST via ->data during graph build need their
++// original host-accessible tensors retained. Two are host-only and need no GPU
++// mirror:
+ //   - "vit.pos_embed"   : host bicubic interp in DinoBackbone::interp_pos_embed
+ //   - "vit.camera_token": host camera-token inject in DinoBackbone::forward*
+-//   - "vit.norm.weight" / "vit.norm.bias": host post-norm in DinoBackbone
++//   - "vit.norm.weight" / "vit.norm.bias" are also read on the host, but must
++//     be mirrored because the fused backbone consumes them in GPU graph nodes.
+ // (The metric branch aliases m_vit.* -> vit.* so the same names apply.)
+ static bool is_host_read_tensor(const std::string& name) {
+-    return name == "vit.pos_embed"   || name == "vit.camera_token" ||
+-           name == "vit.norm.weight" || name == "vit.norm.bias";
++    return name == "vit.pos_embed" || name == "vit.camera_token";
+ }
+ 
+ static uint32_t kv_u32(gguf_context* g, const char* k, uint32_t d=0){
+@@ -76,6 +76,7 @@ bool ModelLoader::load(const std::string& path){
+     if (gguf_) { gguf_free(gguf_); gguf_ = nullptr; }
+     if (ctx_)  { ggml_free(ctx_);  ctx_  = nullptr; }
+     tensors_.clear();
++    host_tensors_.clear();
+     gguf_init_params p{ /*no_alloc=*/false, /*ctx=*/&ctx_ };
+     gguf_ = gguf_init_from_file(path.c_str(), p);
+     if (!gguf_){ DA_LOG("gguf_init_from_file failed: %s", path.c_str()); return false; }
+@@ -152,6 +153,7 @@ bool ModelLoader::load(const std::string& path){
+         if (s.rfind("m_vit.", 0) == 0)  tensors_["vit."  + s.substr(6)] = t;
+         else if (s.rfind("m_head.", 0) == 0) tensors_["head." + s.substr(7)] = t;
+     }
++    host_tensors_ = tensors_;
+     // All four structural dims are converter-written and required by the graph
+     // (head_dim/num_heads feed attention reshapes). Gate on all of them so a
+     // malformed external GGUF fails here rather than dividing by zero later.
+@@ -163,6 +165,11 @@ ggml_tensor* ModelLoader::tensor(const std::string& name) const {
+     return it==tensors_.end() ? nullptr : it->second;
+ }
+ 
++ggml_tensor* ModelLoader::host_tensor(const std::string& name) const {
++    auto it = host_tensors_.find(name);
++    return it == host_tensors_.end() ? nullptr : it->second;
++}
++
+ bool ModelLoader::offload_weights(Backend& be){
+     // CPU backend: no-op. Graphs keep referencing the gguf host tensors in ctx_
+     // directly (zero-copy; the CPU path is byte-identical to before this change).
+@@ -190,10 +197,11 @@ bool ModelLoader::offload_weights(Backend& be){
+     std::vector<std::pair<ggml_tensor*, const void*>> ups; ups.reserve(n);
+     std::unordered_map<ggml_tensor*, ggml_tensor*> src2dev; src2dev.reserve(n);
+     std::unordered_map<std::string, ggml_tensor*> newmap; newmap.reserve(n);
+-    size_t n_dev = 0;
++    size_t n_dev = 0, n_host = 0;
+     for (auto& kv : tensors_) {
+         if (is_host_read_tensor(kv.first)) {
+             newmap.emplace(kv.first, kv.second);        // keep host tensor as-is
++            ++n_host;
+             continue;
+         }
+         ggml_tensor* s = kv.second;
+@@ -215,7 +223,7 @@ bool ModelLoader::offload_weights(Backend& be){
+         ggml_backend_tensor_set(pr.first, pr.second, 0, ggml_nbytes(pr.first));
+     tensors_.swap(newmap);   // graphs now reference the device-resident weights
+     DA_LOG("offload_weights: %zu weights -> %s (%zu host-read tensors kept on CPU)",
+-           n_dev, be.device_name().c_str(), (size_t)4);
++           n_dev, be.device_name().c_str(), n_host);
+     return true;
+ }
+ } // namespace da
+diff --git a/src/model_loader.hpp b/src/model_loader.hpp
+index 45feb73..e815b88 100644
+--- a/src/model_loader.hpp
++++ b/src/model_loader.hpp
+@@ -38,12 +38,16 @@ public:
+     bool load(const std::string& path);
+     const Config& config() const { return cfg_; }
+     ggml_tensor* tensor(const std::string& name) const;
++    // Original GGUF tensor in host-accessible memory. Use only for graph-build
++    // helpers that dereference tensor->data on the CPU.
++    ggml_tensor* host_tensor(const std::string& name) const;
+     bool offload_weights(Backend& be);
+ private:
+     Config cfg_;
+     gguf_context* gguf_ = nullptr;
+     ggml_context* ctx_  = nullptr;
+     std::unordered_map<std::string, ggml_tensor*> tensors_;
++    std::unordered_map<std::string, ggml_tensor*> host_tensors_;
+     ggml_context* device_ctx_ = nullptr;
+     ggml_backend_buffer* gpu_buf_ = nullptr;
+ };
+-- 
+2.34.1
