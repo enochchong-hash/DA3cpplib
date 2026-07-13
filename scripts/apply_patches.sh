@@ -23,15 +23,70 @@ cd "$REL_ROOT"
 
 echo "=== Applying patches to submodules ==="
 
-# Initialize submodules if needed
-if [ ! -e "3rdparty/depth-anything.cpp/.git" ]; then
-    echo "Initializing submodules..."
-    git submodule update --init
+# Keep both levels' URLs in sync with their .gitmodules files.  A plain
+# `git submodule update --init` only guarantees the first level; --recursive
+# is required for depth-anything.cpp's third_party/ggml checkout.
+echo "Synchronizing submodule URLs (including nested submodules)..."
+git submodule sync --recursive
+
+ENGINE_DIR="$REL_ROOT/3rdparty/depth-anything.cpp"
+GGML_DIR="$ENGINE_DIR/third_party/ggml"
+
+is_git_worktree() {
+    # The .git marker is essential here: `git -C empty/submodule-dir` otherwise
+    # walks up to the parent repository and incorrectly reports success.
+    [ -e "$1/.git" ] &&
+        git -C "$1" rev-parse --is-inside-work-tree >/dev/null 2>&1
+}
+
+# Initialize each level from the repository that owns its .gitmodules entry.
+# Doing this in two stages also avoids global `submodule.*.update=none` settings
+# silently skipping the nested checkout during one top-level recursive update.
+if ! is_git_worktree "$ENGINE_DIR"; then
+    echo "Initializing depth-anything.cpp submodule..."
+    git -c submodule.3rdparty/depth-anything.cpp.update=checkout \
+        submodule update --init --checkout -- 3rdparty/depth-anything.cpp
 fi
-if [ ! -e "3rdparty/depth-anything.cpp/third_party/ggml/.git" ]; then
+
+if ! is_git_worktree "$ENGINE_DIR"; then
+    echo "ERROR: depth-anything.cpp submodule was not initialized by Git."
+    exit 1
+fi
+
+# Validate the engine checkout before asking it to initialize children.  This
+# gives a useful error when an old release still pins a different engine tree.
+git -C "$ENGINE_DIR" cat-file -e "$ENGINE_UPSTREAM^{commit}" || {
+    echo "ERROR: depth-anything.cpp base $ENGINE_UPSTREAM is unavailable."
+    exit 1
+}
+
+echo "Synchronizing depth-anything.cpp nested submodule URLs..."
+git -C "$ENGINE_DIR" submodule sync --recursive
+
+if ! is_git_worktree "$GGML_DIR"; then
     echo "Initializing nested ggml submodule..."
-    git -C 3rdparty/depth-anything.cpp submodule update --init --recursive
+    # Do not pass a pathspec here.  Older Git versions/configurations can fail
+    # with "pathspec ... did not match" before reading the nested .gitmodules.
+    # The engine has only the dependencies declared in that file, so updating
+    # all of them recursively is both safer and equivalent for this release.
+    git -C "$ENGINE_DIR" -c submodule.third_party/ggml.update=checkout \
+        submodule update --init --checkout --recursive
 fi
+
+if ! is_git_worktree "$GGML_DIR"; then
+    echo "ERROR: Git did not initialize nested ggml at: $GGML_DIR"
+    echo "Check the command output above and the nested configuration with:"
+    echo "  git -C $ENGINE_DIR submodule status"
+    echo "  git -C $ENGINE_DIR config --get-regexp '^submodule\\.'"
+    exit 1
+fi
+
+# Fail with a useful message before git-log/git-am if a shallow or incomplete
+# checkout does not contain the public nested patch base.
+git -C "$GGML_DIR" cat-file -e "$GGML_UPSTREAM^{commit}" || {
+    echo "ERROR: nested ggml base $GGML_UPSTREAM is unavailable."
+    exit 1
+}
 
 # apply_patch_set <name> <repo_dir> <upstream_pin> <patch_dir>
 #
@@ -87,9 +142,6 @@ apply_patch_set() {
 }
 
 echo ""
-GGML_DIR="$REL_ROOT/3rdparty/depth-anything.cpp/third_party/ggml"
-ENGINE_DIR="$REL_ROOT/3rdparty/depth-anything.cpp"
-
 apply_patch_set "ggml"   "$GGML_DIR"   "$GGML_UPSTREAM" "$PATCH_DIR/ggml"
 apply_patch_set "engine" "$ENGINE_DIR" "$ENGINE_UPSTREAM" "$PATCH_DIR/depth-anything.cpp"
 

@@ -95,6 +95,7 @@ echo ""
 # Apply patches
 echo "Applying patches..."
 echo "  depth-anything.cpp base: $DA3_DEPTH_ANYTHING_UPSTREAM"
+echo "  nested submodules will be initialized recursively"
 "$SCRIPT_DIR/apply_patches.sh"
 echo ""
 
