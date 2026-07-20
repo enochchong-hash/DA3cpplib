@@ -122,19 +122,27 @@ bool infer(Model& model, const Image& image, Result& result,
         if (options.with_pose || options.ray_pose) return false;
         if (!engine.depth_mono(internal, result.depth, result.sky, height, width)) return false;
     } else if (options.with_pose) {
+        if (options.legacy_resize && options.ray_pose) return false;
         const bool ok = options.ray_pose
             ? engine.depth_pose_rays_native(internal, result.depth, result.confidence,
                                             result.extrinsics, result.intrinsics,
                                             height, width)
-            : engine.depth_pose_native(internal, result.depth, result.confidence,
-                                       result.extrinsics, result.intrinsics,
-                                       height, width);
+            : options.legacy_resize
+                ? engine.depth_pose(internal, result.depth, result.confidence,
+                                    result.extrinsics, result.intrinsics,
+                                    height, width)
+                : engine.depth_pose_native(internal, result.depth, result.confidence,
+                                           result.extrinsics, result.intrinsics,
+                                           height, width);
         if (!ok) return false;
         result.has_pose = true;
     } else {
         if (options.ray_pose) return false;
-        if (!engine.depth_native_image(internal, result.depth, result.confidence,
-                                       height, width)) return false;
+        const bool ok = options.legacy_resize
+            ? engine.depth_image(internal, result.depth, result.confidence, height, width)
+            : engine.depth_native_image(internal, result.depth, result.confidence,
+                                        height, width);
+        if (!ok) return false;
     }
 
     finish_result(result, height, width, info.is_metric);

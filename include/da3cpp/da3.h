@@ -74,6 +74,10 @@ struct InferOptions {
     // Select the auxiliary ray-based pose path. Requires an aux-bearing model
     // and with_pose=true.
     bool ray_pose = false;
+    // Use the legacy floor-to-patch resize path, which keeps the output near
+    // the source resolution. This is substantially slower and is primarily
+    // retained for the UI's explicit high-resolution mode.
+    bool legacy_resize = false;
 };
 
 std::shared_ptr<Model> load_model(const Params& params);

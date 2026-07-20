@@ -55,6 +55,9 @@ camera pose output, nested metric loading, and an advanced zero-copy prepared
 input hook are also included. See [docs/architecture.md](docs/architecture.md)
 and [docs/porting.md](docs/porting.md).
 
+Set `da3::InferOptions::legacy_resize` for the slower near-input-resolution
+path used by applications that explicitly request a high-density depth map.
+
 ## CMake options
 
 | Option | Default | Meaning |
