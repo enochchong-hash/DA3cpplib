@@ -1,0 +1,65 @@
+From 80ea2cede47448f7c30691d6baa96567850cbf84 Mon Sep 17 00:00:00 2001
+From: Enoch Chong <enoch.chong@devolrobots.com>
+Date: Fri, 3 Jul 2026 10:06:08 +0800
+Subject: [PATCH] initial
+
+---
+ src/ggml-cuda/ggml-cuda.cu | 33 +++++++++++++++++++++++++++++++++
+ 1 file changed, 33 insertions(+)
+
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index 61041bd..4caf2bd 100644
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -2826,8 +2826,35 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+         nb1, nb2, nb3, stream);
+ }
+ 
++
++// == depth-anything.cpp local extension: CUDA-capable custom ops ==============
++// A GGML_OP_CUSTOM node whose userdata points to this descriptor (identified
++// by `magic`) is executed on the CUDA backend by calling `launch` with the
++// node and the backend stream, instead of being scheduled onto the CPU.
++// Layout mirrored in depth-anything.cpp/src/cuda_head_kernels.hpp -- keep in sync.
++struct ggml_cuda_custom_launch {
++    uint64_t magic;                 // GGML_CUDA_CUSTOM_MAGIC
++    void (*launch)(struct ggml_tensor * dst, uintptr_t cuda_stream, void * user);
++    void * user;
++};
++#define GGML_CUDA_CUSTOM_MAGIC 0x3344414355444121ULL
++
++static const ggml_cuda_custom_launch * ggml_cuda_custom_get(const struct ggml_tensor * t) {
++    if (t->op != GGML_OP_CUSTOM) return nullptr;
++    struct ggml_custom_op_params p;
++    memcpy(&p, t->op_params, sizeof(p));
++    const ggml_cuda_custom_launch * cl = (const ggml_cuda_custom_launch *) p.userdata;
++    return (cl && cl->magic == GGML_CUDA_CUSTOM_MAGIC) ? cl : nullptr;
++}
++// =============================================================================
++
+ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+     switch (dst->op) {
++        case GGML_OP_CUSTOM: {
++            const ggml_cuda_custom_launch * cl = ggml_cuda_custom_get(dst);
++            if (cl == nullptr) return false;   // plain CPU custom op: unsupported here
++            cl->launch(dst, (uintptr_t) ctx.stream(), cl->user);
++        } break;
+         case GGML_OP_ARGMAX:
+             ggml_cuda_argmax(ctx, dst);
+             break;
+@@ -5330,6 +5357,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                 ggml_type src0_type = op->src[0]->type;
+                 return src0_type != GGML_TYPE_I32 && src0_type != GGML_TYPE_I16;
+             } break;
++        case GGML_OP_CUSTOM:
++            {
++                // Only custom ops carrying our CUDA launch descriptor (see
++                // ggml_cuda_custom_launch above); everything else -> CPU.
++                return ggml_cuda_custom_get(op) != nullptr;
++            } break;
+         case GGML_OP_ARGMAX:
+         case GGML_OP_COUNT_EQUAL:
+             {
+-- 
+2.34.1
+

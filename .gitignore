@@ -1,0 +1,8 @@
+/build/
+/build-*/
+/resources/models/*
+!/resources/models/.gitkeep
+*.safetensors
+__pycache__/
+*.pyc
+.venv/
