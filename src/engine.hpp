@@ -52,6 +52,8 @@ public:
     bool tensorrt_enabled() const { return trt_options_.enabled; }
     bool tensorrt_active() const { return trt_active_; }
     void clear_tensorrt_active() { trt_active_ = false; }
+    const std::string& device_name() const { return be_.device_name(); }
+    bool gpu_active() const { return be_.is_offloading(); }
     // True iff this is a standalone monocular checkpoint: single-head DPT
     // (output_dim==1) with a parallel sky head. Routes the CLI depth command to
     // depth_mono (depth + sky) instead of the DualDPT depth_native (depth + conf).

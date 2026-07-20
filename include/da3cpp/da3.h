@@ -73,6 +73,8 @@ struct ModelInfo {
     bool has_aux_ray_head = false;
     bool tensorrt_enabled = false;
     bool tensorrt_active = false;
+    std::string device_name = "cpu";
+    bool gpu_active = false;
 };
 
 struct Result {

@@ -91,6 +91,8 @@ ModelInfo model_info(const Model& model) {
     info.has_aux_ray_head = engine.has_aux();
     info.tensorrt_enabled = engine.tensorrt_enabled();
     info.tensorrt_active = engine.tensorrt_active();
+    info.device_name = engine.device_name();
+    info.gpu_active = engine.gpu_active();
 
     if (engine.is_nested()) {
         info.kind = ModelKind::da3_nested;
