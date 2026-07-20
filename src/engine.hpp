@@ -12,6 +12,23 @@
 namespace da {
 enum class TaskMode { DEPTH, DEPTH_POSE, MULTIVIEW, RECONSTRUCT, NESTED_METRIC };
 
+struct TrtOptions {
+    bool enabled = false;
+    std::string onnx_path;
+    std::string cache_dir;
+    bool fp16 = true;
+    bool fallback_to_ggml = true;
+    size_t workspace_bytes = size_t{2} << 30;
+};
+
+class TrtDepth {
+public:
+    virtual ~TrtDepth() = default;
+    virtual bool ready() = 0;
+    virtual bool infer(const std::vector<float>& chw, int height, int width,
+                       std::vector<float>& depth, std::vector<float>& confidence) = 0;
+};
+
 // Per-view result of the multi-view pipeline.
 struct ViewResult {
     std::vector<float> depth, conf;  // each [H*W] row-major
@@ -21,7 +38,9 @@ struct ViewResult {
 
 class Engine {
 public:
-    static std::unique_ptr<Engine> load(const std::string& gguf_path, int n_threads);
+    ~Engine();
+    static std::unique_ptr<Engine> load(const std::string& gguf_path, int n_threads,
+                                        const TrtOptions& trt = {});
     // Nested metric: loads BOTH the anyview (GIANT) GGUF and the metric (ViT-L
     // + DPT/sky) GGUF. depth_metric() then runs both branches + alignment.
     static std::unique_ptr<Engine> load_nested(const std::string& anyview_gguf,
@@ -30,6 +49,9 @@ public:
     // True iff this engine was created via load_nested() (anyview + metric
     // branches both loaded). depth_metric() is then the valid inference path.
     bool is_nested() const { return metric_ml_ != nullptr; }
+    bool tensorrt_enabled() const { return trt_options_.enabled; }
+    bool tensorrt_active() const { return trt_active_; }
+    void clear_tensorrt_active() { trt_active_ = false; }
     // True iff this is a standalone monocular checkpoint: single-head DPT
     // (output_dim==1) with a parallel sky head. Routes the CLI depth command to
     // depth_mono (depth + sky) instead of the DualDPT depth_native (depth + conf).
@@ -130,5 +152,8 @@ private:
     Backend be_;
     std::unique_ptr<ModelLoader> metric_ml_;
     std::unique_ptr<Backend> metric_be_;
+    TrtOptions trt_options_;
+    std::unique_ptr<TrtDepth> trt_depth_;
+    bool trt_active_ = false;
 };
 } // namespace da

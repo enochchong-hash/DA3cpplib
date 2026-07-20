@@ -27,6 +27,20 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
+Optional TensorRT depth backend:
+
+```bash
+# Reuse a local SDK already vendored by sam3cpplib, or omit --copy-from to fetch it.
+scripts/setup/setup_tensorrt.sh --copy-from ../sam3cpplib/3rdparty
+scripts/build.sh cuda --trt
+```
+
+Export the fixed-resolution ONNX graph from an official DA3 checkpoint, then
+set `Params::tensorrt` as described in [docs/tensorrt.md](docs/tensorrt.md).
+TensorRT engine plans are built lazily and cached per graph, GPU, TensorRT
+version, and precision. Shape/build/runtime failures fall back to GGUF by
+default.
+
 ## Embed in another application
 
 ```cmake
@@ -63,6 +77,7 @@ path used by applications that explicitly request a high-density depth map.
 | Option | Default | Meaning |
 |---|---:|---|
 | `DA3CPP_CUDA` | ON | ggml CUDA backend |
+| `DA3CPP_TENSORRT` | OFF | TensorRT ONNX depth backend |
 | `DA3CPP_METAL` | OFF | ggml Metal backend |
 | `DA3CPP_VULKAN` | OFF | ggml Vulkan backend |
 | `DA3CPP_CUSTOM_CUDA_KERNELS` | ON | Compile optional fused DPT kernels |

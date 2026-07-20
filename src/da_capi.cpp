@@ -87,7 +87,9 @@ char* da_capi_info_json(da_ctx* c){
     const auto& cfg = c->engine->config();
     std::string j = "{\"checkpoint\":\"" + json_escape(cfg.checkpoint_name) + "\",\"embed_dim\":" +
         std::to_string(cfg.embed_dim) + ",\"depth\":" + std::to_string(cfg.depth) +
-        ",\"num_heads\":" + std::to_string(cfg.num_heads) + "}";
+        ",\"num_heads\":" + std::to_string(cfg.num_heads) +
+        ",\"tensorrt_enabled\":" + (c->engine->tensorrt_enabled() ? "true" : "false") +
+        ",\"tensorrt_active\":" + (c->engine->tensorrt_active() ? "true" : "false") + "}";
     return dup_cstr(j);
 }
 void da_capi_free_string(char* s){ std::free(s); }
@@ -100,7 +102,12 @@ float* da_capi_depth_path(da_ctx* c, const char* image_path, int* out_h, int* ou
         if (!capi_run_nested(c, image_path, depth, ext, intr, H, W)) return nullptr;
     } else if (c->engine->is_da2()){
         if (!c->engine->depth_relative_path(image_path, depth, H, W)){ c->last_error = "depth: da2 failed"; return nullptr; }
-    } else if (!c->engine->depth(image_path, depth, conf, H, W)){ c->last_error = "depth: failed"; return nullptr; }
+    } else {
+        const bool ok = c->engine->tensorrt_enabled()
+            ? c->engine->depth_native(image_path, depth, conf, H, W)
+            : c->engine->depth(image_path, depth, conf, H, W);
+        if (!ok){ c->last_error = "depth: failed"; return nullptr; }
+    }
     float* p = (float*)std::malloc(depth.size() * sizeof(float));
     if (!p){ c->last_error = "depth: oom"; return nullptr; }
     std::memcpy(p, depth.data(), depth.size() * sizeof(float));

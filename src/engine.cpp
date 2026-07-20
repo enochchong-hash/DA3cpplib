@@ -14,15 +14,54 @@
 #include "gs_adapter.hpp"
 #include "nested.hpp"
 #include "compute_mode.hpp"
+#ifdef DA3_TENSORRT
+#include "trt/trt_depth.hpp"
+#endif
 
 namespace da {
-std::unique_ptr<Engine> Engine::load(const std::string& path, int n_threads){
+Engine::~Engine() = default;
+
+std::unique_ptr<Engine> Engine::load(const std::string& path, int n_threads,
+                                     const TrtOptions& trt){
     std::unique_ptr<Engine> e(new Engine());
     if (!e->ml_.load(path)) { DA_LOG("engine: load failed"); return nullptr; }
     e->be_.set_n_threads(n_threads > 0 ? n_threads : 1);
     if (!e->ml_.offload_weights(e->be_)) { DA_LOG("engine: offload failed"); return nullptr; }
     // Route graph builders to GPU-friendly standard ops iff weights are device-resident.
     da::set_gpu_mode(e->be_.is_offloading());
+    TrtOptions effective_trt = trt;
+    if (!effective_trt.enabled && std::getenv("DA3_TRT")) {
+        effective_trt.enabled = true;
+        if (const char* value = std::getenv("DA3_TRT_ONNX_PATH"))
+            effective_trt.onnx_path = value;
+        if (const char* value = std::getenv("DA3_TRT_CACHE_DIR"))
+            effective_trt.cache_dir = value;
+        effective_trt.fp16 = std::getenv("DA3_TRT_FP32") == nullptr;
+        effective_trt.fallback_to_ggml = std::getenv("DA3_TRT_NO_FALLBACK") == nullptr;
+    }
+    e->trt_options_ = effective_trt;
+    if (effective_trt.enabled) {
+        if (e->is_nested() || e->is_da2() || e->is_mono()) {
+            DA_LOG("engine: TensorRT depth graph supports standard DA3 DualDPT models only");
+            if (!effective_trt.fallback_to_ggml) return nullptr;
+            e->trt_options_.enabled = false;
+            return e;
+        }
+#ifdef DA3_TENSORRT
+        if (effective_trt.onnx_path.empty()) {
+            DA_LOG("engine: TensorRT enabled but onnx_path is empty");
+            if (!effective_trt.fallback_to_ggml) return nullptr;
+        } else {
+            e->trt_depth_ = make_trt_depth(effective_trt);
+            // With fallback disabled, validate/build now so load_model has a
+            // strict success contract. Fallback mode initializes lazily.
+            if (!effective_trt.fallback_to_ggml && !e->trt_depth_->ready()) return nullptr;
+        }
+#else
+        DA_LOG("engine: TensorRT requested but da3cpplib was built with DA3CPP_TENSORRT=OFF");
+        if (!effective_trt.fallback_to_ggml) return nullptr;
+#endif
+    }
     return e;
 }
 std::unique_ptr<Engine> Engine::load_nested(const std::string& anyview_gguf,
@@ -101,6 +140,24 @@ bool Engine::depth_native(const std::string& image_path, std::vector<float>& dep
 }
 bool Engine::depth_native_image(const Image& img, std::vector<float>& depth_out,
                                 std::vector<float>& conf_out, int& H, int& W){
+#ifdef DA3_TENSORRT
+    if (trt_depth_) {
+        Preprocessed p;
+        if (preprocess_real(img, ml_.config(), p) &&
+            trt_depth_->infer(p.chw, p.H, p.W, depth_out, conf_out)) {
+            H = p.H;
+            W = p.W;
+            trt_active_ = true;
+            return true;
+        }
+        trt_active_ = false;
+        if (!trt_options_.fallback_to_ggml) {
+            DA_LOG("depth_native: TensorRT inference failed and fallback is disabled");
+            return false;
+        }
+        DA_LOG("depth_native: TensorRT unavailable for this input; falling back to ggml");
+    }
+#endif
     // Fused backbone+head graph by default (feats stay device-resident). DA_FUSED=0
     // forces the original two-graph path; cat_token=false models always use unfused.
     const char* fenv = std::getenv("DA_FUSED");

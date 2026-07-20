@@ -3,6 +3,11 @@
 /resources/models/*
 !/resources/models/.gitkeep
 *.safetensors
+*.onnx
+*.engine
+*.onnx.cache/
+3rdparty/tensorrt-include/
+3rdparty/tensorrt-libs/
 __pycache__/
 *.pyc
 .venv/

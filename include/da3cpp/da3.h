@@ -9,13 +9,30 @@
 #include <vector>
 
 #define DA3CPP_VERSION_MAJOR 0
-#define DA3CPP_VERSION_MINOR 1
+#define DA3CPP_VERSION_MINOR 2
 #define DA3CPP_VERSION_PATCH 0
-#define DA3CPP_VERSION "0.1.0"
+#define DA3CPP_VERSION "0.2.0"
 
 namespace da3 {
 
 struct Model;
+
+struct TensorRtParams {
+    // TensorRT is opt-in. The library must also be built with
+    // DA3CPP_TENSORRT=ON.
+    bool enabled = false;
+    // Fixed-shape depth-only ONNX graph produced by
+    // scripts/convert/export_da3_depth_onnx.py.
+    std::string onnx_path;
+    // Serialized plans are GPU-, TensorRT-, graph-, and precision-specific.
+    // Empty selects "<onnx_path>.cache".
+    std::string cache_dir;
+    bool fp16 = true;
+    // If TensorRT cannot load or the preprocessed image shape differs from the
+    // exported graph, transparently use the existing GGUF backend.
+    bool fallback_to_ggml = true;
+    std::size_t workspace_bytes = std::size_t{2} << 30;
+};
 
 enum class ModelKind {
     da3,
@@ -28,6 +45,7 @@ enum class ModelKind {
 struct Params {
     std::string model_path;
     int n_threads = 4;
+    TensorRtParams tensorrt;
 };
 
 struct NestedParams {
@@ -53,6 +71,8 @@ struct ModelInfo {
     bool is_metric = false;
     bool has_camera_pose = false;
     bool has_aux_ray_head = false;
+    bool tensorrt_enabled = false;
+    bool tensorrt_active = false;
 };
 
 struct Result {

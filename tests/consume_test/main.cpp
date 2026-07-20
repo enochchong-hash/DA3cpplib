@@ -5,6 +5,9 @@
 int main() {
     da3::Params params;
     params.model_path = "/nonexistent.gguf";
+    params.tensorrt.enabled = false;
+    params.tensorrt.onnx_path = "/nonexistent.onnx";
+    params.tensorrt.fallback_to_ggml = true;
     if (da3::load_model(params)) {
         std::fprintf(stderr, "unexpectedly loaded a nonexistent model\n");
         return 1;

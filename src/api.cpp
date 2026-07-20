@@ -52,7 +52,14 @@ void finish_result(Result& result, int height, int width, bool metric) {
 
 std::shared_ptr<Model> load_model(const Params& params) {
     if (params.model_path.empty()) return nullptr;
-    auto engine = da::Engine::load(params.model_path, params.n_threads);
+    da::TrtOptions trt;
+    trt.enabled = params.tensorrt.enabled;
+    trt.onnx_path = params.tensorrt.onnx_path;
+    trt.cache_dir = params.tensorrt.cache_dir;
+    trt.fp16 = params.tensorrt.fp16;
+    trt.fallback_to_ggml = params.tensorrt.fallback_to_ggml;
+    trt.workspace_bytes = params.tensorrt.workspace_bytes;
+    auto engine = da::Engine::load(params.model_path, params.n_threads, trt);
     if (!engine) return nullptr;
     auto model = std::make_shared<Model>();
     model->engine = std::move(engine);
@@ -82,6 +89,8 @@ ModelInfo model_info(const Model& model) {
     for (std::size_t i = 0; i < 3 && i < config.img_std.size(); ++i) info.std[i] = config.img_std[i];
     info.is_metric = config_is_metric(config) || engine.is_nested();
     info.has_aux_ray_head = engine.has_aux();
+    info.tensorrt_enabled = engine.tensorrt_enabled();
+    info.tensorrt_active = engine.tensorrt_active();
 
     if (engine.is_nested()) {
         info.kind = ModelKind::da3_nested;
@@ -103,6 +112,7 @@ bool infer(Model& model, const Image& image, Result& result,
     result = {};
     if (!model.engine || !valid_image(image)) return false;
     auto& engine = *model.engine;
+    engine.clear_tensorrt_active();
     const auto info = model_info(model);
     auto internal = to_internal_image(image);
     int height = 0;
@@ -168,6 +178,7 @@ bool infer_preprocessed(Model& model, int height, int width,
     result = {};
     if (!model.engine || !upload || height <= 0 || width <= 0) return false;
     auto& engine = *model.engine;
+    engine.clear_tensorrt_active();
     if (engine.is_nested() || engine.is_da2() || engine.is_mono()) return false;
 
     const bool ok = engine.depth_native_prepared([&](ggml_tensor* tensor) {

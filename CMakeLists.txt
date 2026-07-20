@@ -5,7 +5,7 @@ if(TARGET da3cpp)
     return()
 endif()
 
-project(da3cpplib VERSION 0.1.0 LANGUAGES C CXX)
+project(da3cpplib VERSION 0.2.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -23,6 +23,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 endif()
 
 option(DA3CPP_CUDA "Enable the ggml CUDA backend" ON)
+option(DA3CPP_TENSORRT "Build the optional TensorRT depth backend" OFF)
 option(DA3CPP_METAL "Enable the ggml Metal backend" OFF)
 option(DA3CPP_VULKAN "Enable the ggml Vulkan backend" OFF)
 option(DA3CPP_CUSTOM_CUDA_KERNELS "Compile the optional fused DA3 DPT kernels" ON)
@@ -79,6 +80,10 @@ if(DA3CPP_CUDA AND DA3CPP_CUSTOM_CUDA_KERNELS)
     list(APPEND DA3CPP_SOURCES src/cuda_head_kernels.cu)
 endif()
 
+if(DA3CPP_TENSORRT)
+    list(APPEND DA3CPP_SOURCES src/trt/trt_depth.cpp)
+endif()
+
 add_library(da3cpp STATIC ${DA3CPP_SOURCES})
 add_library(da3cpp::da3cpp ALIAS da3cpp)
 # Temporary compatibility for the current release/da3 consumer.
@@ -110,6 +115,22 @@ if(DA3CPP_CUDA AND DA3CPP_CUSTOM_CUDA_KERNELS)
     target_compile_definitions(da3cpp PRIVATE DA_CUDA_HEAD)
     find_package(CUDAToolkit REQUIRED)
     target_link_libraries(da3cpp PUBLIC CUDA::cudart)
+endif()
+
+if(DA3CPP_TENSORRT)
+    target_compile_definitions(da3cpp PRIVATE DA3_TENSORRT)
+    set(DA3CPP_TRT_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/tensorrt-include"
+        CACHE PATH "TensorRT public headers")
+    set(DA3CPP_TRT_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/tensorrt-libs"
+        CACHE PATH "TensorRT runtime library directory")
+    find_path(DA3CPP_TRT_INCLUDE_PATH NvInfer.h PATHS ${DA3CPP_TRT_INCLUDE_DIR} REQUIRED)
+    find_library(DA3CPP_TRT_NVINFER nvinfer PATHS ${DA3CPP_TRT_LIB_DIR} REQUIRED)
+    find_library(DA3CPP_TRT_NVONNXPARSER nvonnxparser PATHS ${DA3CPP_TRT_LIB_DIR} REQUIRED)
+    find_package(CUDAToolkit REQUIRED)
+    target_include_directories(da3cpp PRIVATE ${DA3CPP_TRT_INCLUDE_PATH})
+    target_link_libraries(da3cpp PUBLIC
+        ${DA3CPP_TRT_NVINFER} ${DA3CPP_TRT_NVONNXPARSER} CUDA::cudart)
+    set_target_properties(da3cpp PROPERTIES BUILD_RPATH "${DA3CPP_TRT_LIB_DIR}")
 endif()
 
 if(DA3CPP_BUILD_CLI)
