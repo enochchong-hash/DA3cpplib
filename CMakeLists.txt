@@ -115,6 +115,22 @@ if(DA3CPP_CUDA AND DA3CPP_CUSTOM_CUDA_KERNELS)
     target_compile_definitions(da3cpp PRIVATE DA_CUDA_HEAD)
     find_package(CUDAToolkit REQUIRED)
     target_link_libraries(da3cpp PUBLIC CUDA::cudart)
+    # da3cpp compiles its own CUDA source (src/cuda_head_kernels.cu). ggml picks
+    # a CMAKE_CUDA_ARCHITECTURES default, but only via a plain scope-local set()
+    # inside its ggml-cuda subdirectory (no CACHE / no PARENT_SCOPE), so that
+    # value never reaches this scope. Without an explicit architecture, da3cpp's
+    # CUDA_ARCHITECTURES would be empty and CMP0104 aborts at generate time
+    # ("CUDA_ARCHITECTURES is empty for target da3cpp"). Honor a cache/-D
+    # override when present, otherwise pick a sensible default.
+    if(CMAKE_CUDA_ARCHITECTURES)
+        set_target_properties(da3cpp PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+    elseif(CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
+        # Build for the GPUs present on the build machine.
+        set_target_properties(da3cpp PROPERTIES CUDA_ARCHITECTURES "native")
+    else()
+        # Broad fallback for older CMake without "native" support.
+        set_target_properties(da3cpp PROPERTIES CUDA_ARCHITECTURES "75-virtual;80-virtual;86-real;89-real")
+    endif()
 endif()
 
 if(DA3CPP_TENSORRT)
